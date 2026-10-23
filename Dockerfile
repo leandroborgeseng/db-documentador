@@ -24,4 +24,6 @@ ENV OUTPUT_DIR=/output \
 VOLUME ["/output"]
 EXPOSE 8080
 
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD curl -fs http://localhost:${PORT:-8080}/health || exit 1
+
 CMD ["python3", "/app/run.py"]
