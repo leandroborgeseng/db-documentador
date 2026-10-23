@@ -47,7 +47,7 @@ CFG = {
     "schemas": env("SCHEMAS", "all"),  # "all" ou lista: "dbo,sus"
     "row_counts": env("ROW_COUNTS", "true").lower() == "true",
     "parallel": int(env("PARALLEL", "2")),
-    "every_hours": float(env("RUN_EVERY_HOURS", "24")),
+    "every_hours": float(env("RUN_EVERY_HOURS", "168")),
     "java_opts": env("JAVA_OPTS", "-Xmx1g"),
     "timeout_min": int(env("SCHEMASPY_TIMEOUT_MIN", "60")),
     "extra_connprops": env("JDBC_CONNPROPS", "encrypt\\=false;trustServerCertificate\\=true"),
@@ -378,6 +378,8 @@ def run_cycle():
     finally:
         with STATUS_LOCK:
             STATUS.update(finished=now(), running=False)
+            if not STATUS.get("cycle_error"):
+                STATUS["finished_ts"] = time.time()
         write_index()
 
 
@@ -391,7 +393,7 @@ def safe_name(db):
     return "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in db)
 
 
-BADGE = {"ok": "ok", "parcial": "warn", "erro": "err", "executando": "run", "na fila": "wait"}
+BADGE = {"ok": "ok", "parcial": "warn", "erro": "err", "executando": "run", "na fila": "wait", "interrompido": "warn"}
 
 
 def write_index():
@@ -492,10 +494,40 @@ def serve():
     srv.serve_forever()
 
 
+def load_previous():
+    """Recupera o levantamento salvo no volume (status.json) e diz há quantos segundos terminou."""
+    path = os.path.join(CFG["output"], "status.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            old = json.load(f)
+    except Exception:
+        return None
+    with STATUS_LOCK:
+        for db, st in (old.get("databases") or {}).items():
+            if st.get("state") in ("executando", "na fila"):
+                st["state"] = "interrompido"
+            STATUS["databases"][db] = st
+        for k in ("started", "finished", "finished_ts"):
+            if old.get(k) is not None:
+                STATUS[k] = old[k]
+        STATUS["running"] = False
+    ts = old.get("finished_ts")
+    return (time.time() - ts) if ts else None
+
+
 def main():
     os.makedirs(CFG["output"], exist_ok=True)
+    age = load_previous()
     write_index()
     threading.Thread(target=serve, daemon=True).start()
+    if age is not None and CFG["every_hours"] > 0 and age < CFG["every_hours"] * 3600:
+        wait = CFG["every_hours"] * 3600 - age
+        log(f"Levantamento salvo de {age/3600:.1f} h atrás; próxima varredura em {wait/3600:.1f} h")
+        time.sleep(wait)
+    elif age is not None and CFG["every_hours"] <= 0:
+        log("Levantamento salvo encontrado; RUN_EVERY_HOURS=0, só servindo os arquivos.")
+        while True:
+            time.sleep(3600)
     while True:
         run_cycle()
         if CFG["every_hours"] <= 0:

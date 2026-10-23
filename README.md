@@ -39,7 +39,7 @@ O SQL Server precisa aceitar login SQL (modo de autenticação misto).
 | `SCHEMAS` | `all` | `all` ou lista: `dbo,sus` |
 | `ROW_COUNTS` | `true` | Contagem de linhas via `sys.dm_db_partition_stats` (não lê dados) |
 | `PARALLEL` | `2` | Bancos documentados ao mesmo tempo |
-| `RUN_EVERY_HOURS` | `24` | Intervalo entre varreduras; `0` = roda uma vez |
+| `RUN_EVERY_HOURS` | `168` | Intervalo entre varreduras (168 = semanal). O resultado fica no volume `/output`; ao reiniciar, só refaz se a última varredura completa tiver mais que esse intervalo. `0` = roda uma vez |
 | `JAVA_OPTS` | `-Xmx1g` | Memória do SchemaSpy (aumente para bancos com milhares de tabelas) |
 | `JDBC_CONNPROPS` | `encrypt\=false;trustServerCertificate\=true` | Propriedades do driver JDBC |
 | `SITE_TITLE` | `Documentação dos bancos` | Título da página |
