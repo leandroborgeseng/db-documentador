@@ -29,6 +29,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pymssql
 
+import bundle
 import sqlconsole
 
 
@@ -490,7 +491,8 @@ def _write_index():
         state = s.get("state", "?")
         err = f'<div class="err-msg">{html.escape(s["error"])}</div>' if s.get("error") else ""
         rows.append(
-            f"<tr><td><strong>{html.escape(db)}</strong>{err}</td>"
+            f'<tr><td class="ck"><input type="checkbox" class="sel" value="{html.escape(db)}" aria-label="Selecionar {html.escape(db)}"></td>'
+            f"<td><strong>{html.escape(db)}</strong>{err}</td>"
             f'<td><span class="b {BADGE.get(state, "wait")}">{html.escape(state)}</span></td>'
             f"<td class='n'>{s.get('tables') if s.get('tables') is not None else ''}</td>"
             f"<td class='n'>{s.get('views') if s.get('views') is not None else ''}</td>"
@@ -514,15 +516,31 @@ th{{font-size:12px;color:var(--mu);font-weight:600;text-transform:uppercase;lett
 tr:last-child td{{border-bottom:0}} a{{color:var(--run)}}
 .b{{font-size:12px;padding:2px 8px;border-radius:99px;border:1px solid currentColor;white-space:nowrap}}
 .ok{{color:var(--ok)}}.warn{{color:var(--warn)}}.err{{color:var(--err)}}.run{{color:var(--run)}}.wait{{color:var(--mu)}}
+.tools{{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:0 0 10px}} .m2{{color:var(--mu);font-size:13px}}
+button{{font:inherit;color:inherit;background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:5px 10px;cursor:pointer}}
+button.pri{{background:var(--run);color:#fff;border-color:var(--run)}} button:disabled{{opacity:.5;cursor:default}} td.ck,th.ck{{width:28px}}
 .err-msg{{color:var(--err);font-size:12px;margin-top:4px;max-width:420px}}
 </style></head><body><main>
 <h1>{html.escape(CFG['title'])}</h1>
 {'<p><a href="/sql">Console SQL</a></p>' if CFG['sql_console'] else ''}
 <p class="m">Servidor {html.escape(CFG['host'])} · {len(snap['databases'])} bancos · varredura {cycle}{nxt}.
 Estrutura e amostras de {CFG['sample_rows']} linhas por tabela (colunas sensíveis mascaradas).</p>
-<div class="wrap"><table><thead><tr><th>Banco</th><th>Situação</th><th>Tabelas</th><th>Views</th><th>Atualizado</th><th>Documentação</th></tr></thead>
-<tbody>{''.join(rows) or '<tr><td colspan="6">Listando bancos…</td></tr>'}</tbody></table></div>
-</main></body></html>"""
+<div class="tools"><button type="button" id="all">Marcar todos</button>
+<label><input type="checkbox" id="json"> incluir JSON de metadados</label>
+<button type="button" id="dl" class="pri" disabled>Baixar .md selecionados</button> <span id="cnt" class="m2">0 selecionados</span></div>
+<div class="wrap"><table><thead><tr><th class="ck"></th><th>Banco</th><th>Situação</th><th>Tabelas</th><th>Views</th><th>Atualizado</th><th>Documentação</th></tr></thead>
+<tbody>{''.join(rows) or '<tr><td colspan="7">Listando bancos…</td></tr>'}</tbody></table></div>
+</main><script>
+const KEY='dbdoc-sel',boxes=[...document.querySelectorAll('.sel')],dl=document.getElementById('dl'),all=document.getElementById('all');
+const saved=new Set(JSON.parse(localStorage.getItem(KEY)||'[]'));boxes.forEach(b=>b.checked=saved.has(b.value));
+function upd(){{const n=boxes.filter(b=>b.checked).length;document.getElementById('cnt').textContent=n+(n==1?' selecionado':' selecionados');
+ dl.disabled=!n;all.textContent=n&&n===boxes.length?'Desmarcar todos':'Marcar todos';
+ localStorage.setItem(KEY,JSON.stringify(boxes.filter(b=>b.checked).map(b=>b.value)))}}
+boxes.forEach(b=>b.addEventListener('change',upd));
+all.onclick=()=>{{const on=!(boxes.length&&boxes.every(b=>b.checked));boxes.forEach(b=>b.checked=on);upd()}};
+dl.onclick=()=>{{const p=new URLSearchParams();boxes.filter(b=>b.checked).forEach(b=>p.append('db',b.value));
+ if(document.getElementById('json').checked)p.set('json','1');location.href='/api/bundle?'+p}};upd();
+</script></body></html>"""
     tmp = os.path.join(CFG["output"], "index.html.tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(page)
@@ -639,7 +657,28 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._send(200, page, "text/html; charset=utf-8")
         if not self._authorized():
             return
+        if path == "/api/bundle":
+            return self._bundle()
         super().do_GET()
+
+    def _bundle(self):
+        import urllib.parse
+        qs = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "", keep_blank_values=True)
+        with STATUS_LOCK:
+            known = list(STATUS["databases"].keys())
+        try:
+            sel = bundle.resolve_databases(CFG["output"], qs.get("db", []), known)
+        except ValueError as e:
+            return self._send(400, {"error": str(e)})
+        name, data = bundle.build_zip(sel, include_json=qs.get("json", [""])[0] in ("1", "true", "on"))
+        log(f"[bundle] {len(sel)} bancos, {len(data)} bytes")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]

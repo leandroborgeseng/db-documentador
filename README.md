@@ -82,3 +82,7 @@ ALTER ROLE db_datareader ADD MEMBER dbdoc_console;
 ```
 
 Testes do validador: `python3 -m unittest discover -s tests`.
+
+## Baixar .md selecionados
+
+Na página inicial, marque os bancos (ou "Marcar todos") e clique em **Baixar .md selecionados**. O `.zip` (`documentacao-md-AAAAMMDD.zip`) traz, por banco, os `.md` da pasta (`schema.md`, `amostras.md`), opcionalmente o `schema.json`, e um `LEIA-ME.md` pensado para entregar a uma IA. Endpoint: `GET /api/bundle?db=A&db=B[&json=1]` (com Basic auth).
