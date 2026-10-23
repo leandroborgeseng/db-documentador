@@ -1,0 +1,31 @@
+services:
+  db-documentador:
+    build: .
+    restart: unless-stopped
+    environment:
+      MSSQL_HOST: ${MSSQL_HOST}
+      MSSQL_PORT: ${MSSQL_PORT:-1433}
+      MSSQL_USER: ${MSSQL_USER}
+      MSSQL_PASSWORD: ${MSSQL_PASSWORD}
+      DATABASES: ${DATABASES:-}
+      EXCLUDE_DATABASES: ${EXCLUDE_DATABASES:-}
+      SCHEMAS: ${SCHEMAS:-all}
+      ROW_COUNTS: ${ROW_COUNTS:-true}
+      PARALLEL: ${PARALLEL:-2}
+      RUN_EVERY_HOURS: ${RUN_EVERY_HOURS:-24}
+      JAVA_OPTS: ${JAVA_OPTS:--Xmx1g}
+      BASIC_AUTH_USER: ${BASIC_AUTH_USER:-}
+      BASIC_AUTH_PASSWORD: ${BASIC_AUTH_PASSWORD:-}
+      SITE_TITLE: ${SITE_TITLE:-Documentação dos bancos}
+    volumes:
+      - docs:/output
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  docs:
