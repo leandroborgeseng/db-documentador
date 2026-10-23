@@ -10,7 +10,7 @@ Documentador de bancos SQL Server.
 4. Gera uma página inicial com todos os bancos e serve tudo via HTTP.
 5. Repete a cada RUN_EVERY_HOURS horas (0 = roda uma vez e só serve).
 
-Nenhuma linha de dados das tabelas é lida.
+Lê só uma amostra de SAMPLE_ROWS linhas por tabela (amostras.md, com colunas sensíveis mascaradas).
 """
 
 import base64
@@ -28,6 +28,8 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 
 import pymssql
+
+import sqlconsole
 
 
 def env(name, default=None, required=False):
@@ -56,6 +58,15 @@ CFG = {
     "auth_user": env("BASIC_AUTH_USER", ""),
     "auth_pass": env("BASIC_AUTH_PASSWORD", ""),
     "title": env("SITE_TITLE", "Documentação dos bancos"),
+    "sample_rows": int(env("SAMPLE_ROWS", "20")),
+    "sample_views": env("SAMPLE_VIEWS", "false").lower() == "true",
+    "sample_mask": sqlconsole.compile_mask(env("SAMPLE_MASK_REGEX", sqlconsole.DEFAULT_MASK_REGEX)),
+    "sample_timeout": int(env("SAMPLE_TIMEOUT", "30")),
+    "sql_console": env("SQL_CONSOLE", "false").lower() == "true",
+    "sql_user": env("SQL_CONSOLE_USER", "") or env("MSSQL_USER", ""),
+    "sql_pass": env("SQL_CONSOLE_PASSWORD", "") if env("SQL_CONSOLE_USER", "") else env("MSSQL_PASSWORD", ""),
+    "sql_timeout": int(env("SQL_CONSOLE_TIMEOUT", "30")),
+    "sql_max_rows": int(env("SQL_CONSOLE_MAX_ROWS", "1000")),
 }
 
 SYSTEM_DBS = {"master", "model", "msdb", "tempdb", "distribution", "ssisdb", "reportserver", "reportservertempdb"}
@@ -327,12 +338,59 @@ def set_status(db, **kwargs):
     write_index()
 
 
+def _qi(name):
+    return "[" + name.replace("]", "]]") + "]"
+
+
+def export_samples(db, objects, outdir):
+    """Grava amostras.md com TOP N linhas por tabela (transação sempre desfeita)."""
+    n = CFG["sample_rows"]
+    targets = [o for o in objects if o["type"] == "table" or (CFG["sample_views"] and o["type"] == "view")]
+    parts = [f"# Amostras — {db}\n",
+             f"Até {n} linhas por objeto, gerado em {now()}. "
+             f"Colunas sensíveis mascaradas como `***`.\n"]
+    conn = pymssql.connect(
+        server=CFG["host"], port=CFG["port"], user=CFG["user"], password=CFG["password"],
+        database=db, login_timeout=20, timeout=CFG["sample_timeout"], charset="UTF-8", autocommit=False,
+    )
+    errors = 0
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SET LOCK_TIMEOUT {CFG['sample_timeout'] * 1000}")
+        for o in targets:
+            full = f"{o['schema']}.{o['name']}"
+            parts.append(f"\n## {full}{' (view)' if o['type'] == 'view' else ''}\n")
+            try:
+                cur.execute("BEGIN TRANSACTION")
+                try:
+                    cur.execute(f"SELECT TOP {n} * FROM {_qi(o['schema'])}.{_qi(o['name'])}")
+                    cols = [c[0] or f"col{i + 1}" for i, c in enumerate(cur.description or [])]
+                    rows = cur.fetchall()
+                finally:
+                    conn.rollback()
+                parts.append(sqlconsole.md_table(cols, rows, CFG["sample_mask"]) if rows else "_(sem linhas)_")
+            except Exception as exc:
+                errors += 1
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                parts.append(f"_Erro ao ler amostra: {sqlconsole.format_cell(str(exc), 300)}_")
+    finally:
+        conn.close()
+    tmp = os.path.join(outdir, "amostras.md.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(parts) + "\n")
+    os.replace(tmp, os.path.join(outdir, "amostras.md"))
+    return len(targets), errors
+
+
 def document_database(db):
     outdir = os.path.join(CFG["output"], "bancos", safe_name(db))
     os.makedirs(outdir, exist_ok=True)
     set_status(db, state="executando", started=now(), error=None)
     log(f"[{db}] início")
-    result = {"tables": None, "views": None, "metadata": False, "schemaspy": None}
+    result = {"tables": None, "views": None, "metadata": False, "schemaspy": None, "samples": False}
     errors = []
     try:
         data = export_metadata(db, outdir)
@@ -343,6 +401,14 @@ def document_database(db):
     except Exception as exc:
         errors.append(f"metadados: {exc}")
         log(f"[{db}] erro nos metadados: {exc}")
+    if result["metadata"] and CFG["sample_rows"] > 0:
+        try:
+            total, errs = export_samples(db, data["objects"], outdir)
+            result["samples"] = True
+            log(f"[{db}] amostras ok: {total} objetos, {errs} com erro")
+        except Exception as exc:
+            errors.append(f"amostras: {exc}")
+            log(f"[{db}] erro nas amostras: {exc}")
     try:
         result["schemaspy"] = run_schemaspy(db, outdir)
         log(f"[{db}] SchemaSpy ok")
@@ -417,6 +483,8 @@ def _write_index():
         if s.get("metadata"):
             links.append(f'<a href="{base}schema.md">Dicionário (.md)</a>')
             links.append(f'<a href="{base}schema.json">.json</a>')
+        if s.get("samples"):
+            links.append(f'<a href="{base}amostras.md">Amostras (.md)</a>')
         if s.get("state") in ("erro", "parcial", "ok"):
             links.append(f'<a href="{base}schemaspy.log">log</a>')
         state = s.get("state", "?")
@@ -449,8 +517,9 @@ tr:last-child td{{border-bottom:0}} a{{color:var(--run)}}
 .err-msg{{color:var(--err);font-size:12px;margin-top:4px;max-width:420px}}
 </style></head><body><main>
 <h1>{html.escape(CFG['title'])}</h1>
+{'<p><a href="/sql">Console SQL</a></p>' if CFG['sql_console'] else ''}
 <p class="m">Servidor {html.escape(CFG['host'])} · {len(snap['databases'])} bancos · varredura {cycle}{nxt}.
-Somente estrutura; nenhum dado das tabelas é lido.</p>
+Estrutura e amostras de {CFG['sample_rows']} linhas por tabela (colunas sensíveis mascaradas).</p>
 <div class="wrap"><table><thead><tr><th>Banco</th><th>Situação</th><th>Tabelas</th><th>Views</th><th>Atualizado</th><th>Documentação</th></tr></thead>
 <tbody>{''.join(rows) or '<tr><td colspan="6">Listando bancos…</td></tr>'}</tbody></table></div>
 </main></body></html>"""
@@ -462,26 +531,141 @@ Somente estrutura; nenhum dado das tabelas é lido.</p>
 
 # ---------------------------------------------------------------- servidor HTTP
 
+_DB_CACHE = {"ts": 0, "list": []}
+
+
+def console_databases():
+    if time.time() - _DB_CACHE["ts"] > 600 or not _DB_CACHE["list"]:
+        try:
+            _DB_CACHE["list"] = sorted(list_databases(), key=str.lower)
+        except Exception:
+            with STATUS_LOCK:
+                _DB_CACHE["list"] = sorted(STATUS["databases"].keys(), key=str.lower)
+        _DB_CACHE["ts"] = time.time()
+    return _DB_CACHE["list"]
+
+
+def run_console_query(database, query):
+    clean = sqlconsole.validate_query(query)
+    dbs = {d.lower(): d for d in console_databases()}
+    if not database or database.lower() not in dbs:
+        raise sqlconsole.QueryRejected("Banco inválido.")
+    database = dbs[database.lower()]
+    t0 = time.monotonic()
+    conn = pymssql.connect(
+        server=CFG["host"], port=CFG["port"], user=CFG["sql_user"], password=CFG["sql_pass"],
+        database=database, login_timeout=15, timeout=CFG["sql_timeout"], charset="UTF-8",
+        autocommit=False,
+    )
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SET LOCK_TIMEOUT {CFG['sql_timeout'] * 1000}")
+        cur.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        cur.execute("BEGIN TRANSACTION")
+        try:
+            cur.execute(clean)
+            columns = [c[0] or f"col{i + 1}" for i, c in enumerate(cur.description or [])]
+            rows = cur.fetchmany(CFG["sql_max_rows"] + 1) if cur.description else []
+        finally:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        truncated = len(rows) > CFG["sql_max_rows"]
+        rows = [[sqlconsole.to_json_value(v) for v in r] for r in rows[:CFG["sql_max_rows"]]]
+    finally:
+        conn.close()
+    ms = int((time.monotonic() - t0) * 1000)
+    log(f"[sql] db={database} rows={len(rows)}{'+' if truncated else ''} ms={ms} q={' '.join(query.split())[:200]!r}")
+    return {"columns": columns, "rows": rows, "truncated": truncated, "elapsed_ms": ms}
+
+
 class Handler(http.server.SimpleHTTPRequestHandler):
     extensions_map = {**http.server.SimpleHTTPRequestHandler.extensions_map,
                       ".md": "text/plain; charset=utf-8", ".log": "text/plain; charset=utf-8",
                       ".json": "application/json; charset=utf-8"}
 
+    def _authorized(self):
+        if not CFG["auth_user"]:
+            return True
+        expected = "Basic " + base64.b64encode(
+            f"{CFG['auth_user']}:{CFG['auth_pass']}".encode()).decode()
+        if self.headers.get("Authorization") == expected:
+            return True
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="docs"')
+        self.end_headers()
+        return False
+
+    def _send(self, code, body, ctype="application/json; charset=utf-8"):
+        if not isinstance(body, (bytes, str)):
+            body = json.dumps(body, ensure_ascii=False)
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _console_gate(self):
+        """True se pode seguir; senão já respondeu (404 desligado / 403 sem senha)."""
+        if not CFG["sql_console"]:
+            self._send(404, {"error": "Não encontrado."})
+            return False
+        if not CFG["auth_user"] or not CFG["auth_pass"]:
+            self._send(403, {"error": "Console SQL exige BASIC_AUTH_USER e BASIC_AUTH_PASSWORD configurados."})
+            return False
+        return self._authorized()
+
     def do_GET(self):
-        if self.path in ("/health", "/healthz"):
+        path = self.path.split("?", 1)[0]
+        if path in ("/health", "/healthz"):
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"ok")
             return
-        if CFG["auth_user"]:
-            expected = "Basic " + base64.b64encode(
-                f"{CFG['auth_user']}:{CFG['auth_pass']}".encode()).decode()
-            if self.headers.get("Authorization") != expected:
-                self.send_response(401)
-                self.send_header("WWW-Authenticate", 'Basic realm="docs"')
-                self.end_headers()
+        if path in ("/sql", "/sql/", "/api/databases", "/api/sql"):
+            if not self._console_gate():
                 return
+            if path == "/api/databases":
+                return self._send(200, {"databases": console_databases()})
+            if path == "/api/sql":
+                return self._send(405, {"error": "Use POST."})
+            page = (sqlconsole.PAGE.replace("__MAX__", str(CFG["sql_max_rows"]))
+                    .replace("__TIMEOUT__", str(CFG["sql_timeout"])))
+            return self._send(200, page, "text/html; charset=utf-8")
+        if not self._authorized():
+            return
         super().do_GET()
+
+    def do_POST(self):
+        path = self.path.split("?", 1)[0]
+        if path != "/api/sql":
+            return self._send(404, {"error": "Não encontrado."})
+        if not self._console_gate():
+            return
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            if n > 200_000:
+                return self._send(413, {"error": "Consulta muito grande."})
+            data = json.loads(self.rfile.read(n) or b"{}")
+            result = run_console_query(str(data.get("database") or ""), str(data.get("query") or ""))
+            self._send(200, result)
+        except sqlconsole.QueryRejected as e:
+            log(f"[sql] recusada: {e}")
+            self._send(400, {"error": str(e)})
+        except (ValueError, json.JSONDecodeError):
+            self._send(400, {"error": "JSON inválido."})
+        except Exception as e:
+            args = getattr(e, "args", ())
+            msg = args[1] if len(args) > 1 and isinstance(args[1], (bytes, str)) else str(e)
+            if isinstance(msg, bytes):
+                msg = msg.decode("utf-8", "replace")
+            log(f"[sql] erro: {msg[:300]}")
+            self._send(400, {"error": msg[:2000]})
 
     def log_message(self, *args):
         pass

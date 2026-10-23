@@ -18,6 +18,15 @@ services:
       JAVA_OPTS: ${JAVA_OPTS:--Xmx1g}
       BASIC_AUTH_USER: ${BASIC_AUTH_USER:-}
       BASIC_AUTH_PASSWORD: ${BASIC_AUTH_PASSWORD:-}
+      SAMPLE_ROWS: ${SAMPLE_ROWS:-20}
+      SAMPLE_VIEWS: ${SAMPLE_VIEWS:-false}
+      SAMPLE_MASK_REGEX: ${SAMPLE_MASK_REGEX-senha|password|pass|pwd|hash|salt|token|secret|chave|cpf|cnpj|rg|cartao|card}
+      SAMPLE_TIMEOUT: ${SAMPLE_TIMEOUT:-30}
+      SQL_CONSOLE: ${SQL_CONSOLE:-false}
+      SQL_CONSOLE_USER: ${SQL_CONSOLE_USER:-}
+      SQL_CONSOLE_PASSWORD: ${SQL_CONSOLE_PASSWORD:-}
+      SQL_CONSOLE_TIMEOUT: ${SQL_CONSOLE_TIMEOUT:-30}
+      SQL_CONSOLE_MAX_ROWS: ${SQL_CONSOLE_MAX_ROWS:-1000}
       SITE_TITLE: ${SITE_TITLE:-Documentação dos bancos}
     volumes:
       - docs:/output
