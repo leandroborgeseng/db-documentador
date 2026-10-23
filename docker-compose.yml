@@ -3,6 +3,8 @@ services:
     build: .
     restart: unless-stopped
     environment:
+      # Coolify: gera o domínio e roteia 80/443 do proxy para a porta interna 8080
+      SERVICE_FQDN_DBDOC_8080: ${SERVICE_FQDN_DBDOC_8080:-}
       MSSQL_HOST: ${MSSQL_HOST}
       MSSQL_PORT: ${MSSQL_PORT:-1433}
       MSSQL_USER: ${MSSQL_USER}
