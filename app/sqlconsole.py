@@ -438,6 +438,70 @@ def size_info(st):
     return format_size_mb(total), f"Dados: {format_size_mb(d)} · Log: {format_size_mb(lg)}"
 
 
+# ---------------------------------------------------------------- atividade dos bancos
+
+ACTIVITY_SQL_USAGE = (
+    "SELECT DB_NAME(database_id) AS db, MAX(last_user_update) AS w, "
+    "MAX(last_user_seek), MAX(last_user_scan), MAX(last_user_lookup) "
+    "FROM sys.dm_db_index_usage_stats WHERE database_id > 4 GROUP BY database_id")
+ACTIVITY_SQL_START = "SELECT sqlserver_start_time FROM sys.dm_os_sys_info"
+ACTIVITY_SQL_SCHEMA = "SELECT MAX(modify_date) FROM sys.objects WHERE is_ms_shipped = 0"
+ACTIVITY_SQL_BACKUP = (
+    "SELECT database_name, MAX(backup_finish_date) FROM msdb.dbo.backupset "
+    "WHERE type = 'D' GROUP BY database_name")
+INACTIVE_SERVER_DAYS = 30
+INACTIVE_WRITE_DAYS = 90
+
+
+def _dt(v):
+    if v is None or v == "":
+        return None
+    if isinstance(v, dt.datetime):
+        return v.replace(tzinfo=None)
+    try:
+        return dt.datetime.fromisoformat(str(v)).replace(tzinfo=None)
+    except ValueError:
+        return None
+
+
+def fmt_dt(v):
+    d = _dt(v)
+    return d.strftime("%d/%m/%Y %H:%M") if d else "—"
+
+
+def _ago(d, now):
+    days = (now - d).days
+    if days <= 0:
+        return "hoje"
+    return "há 1 dia" if days == 1 else f"há {days} dias"
+
+
+def activity_info(st, server_start, now=None):
+    """(texto, tooltip, possivelmente_inativo) para a coluna 'Última atividade'.
+
+    st: status do banco (last_write, last_read, last_schema_change, last_backup, activity_ok).
+    server_start: início do SQL Server (as estatísticas de uso zeram quando ele reinicia).
+    """
+    now = now or dt.datetime.now()
+    start = _dt(server_start)
+    w, r = _dt(st.get("last_write")), _dt(st.get("last_read"))
+    caveat = ("Fonte: sys.dm_db_index_usage_stats, que zera quando o SQL Server reinicia"
+              + (f" (ligado em {fmt_dt(start)})" if start else "") + ".")
+    tip = [f"Última escrita: {fmt_dt(w)}", f"Última leitura: {fmt_dt(r)}",
+           f"Última mudança de estrutura: {fmt_dt(st.get('last_schema_change'))}",
+           f"Último backup completo: {fmt_dt(st.get('last_backup'))}", caveat]
+    if not st.get("activity_ok"):
+        return "—", "Sem permissão para ler a atividade (precisa de VIEW SERVER STATE). " + caveat, False
+    if w:
+        text = f"escrita {fmt_dt(w)} ({_ago(w, now)})"
+        inactive = (now - w).days > INACTIVE_WRITE_DAYS
+    else:
+        text = (f"sem escrita desde que o servidor ligou em {fmt_dt(start)}" if start
+                else "sem escrita registrada")
+        inactive = bool(start and (now - start).days > INACTIVE_SERVER_DAYS)
+    return text, " · ".join(tip), inactive
+
+
 # ---------------------------------------------------------------- amostras
 
 DEFAULT_MASK_REGEX = r"senha|password|pass|pwd|hash|salt|token|secret|chave|cpf|cnpj|rg|cartao|card"

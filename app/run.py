@@ -449,10 +449,57 @@ def collect_sizes(dbs):
     return sizes
 
 
+def _q_all(sql, database="master"):
+    with connect(database) as conn:
+        cur = conn.cursor()
+        cur.execute(sql)
+        return cur.fetchall()
+
+
+def _iso(v):
+    return v.isoformat(timespec="seconds") if hasattr(v, "isoformat") else (str(v) if v else None)
+
+
+def collect_activity(dbs):
+    """Última escrita/leitura (dm_db_index_usage_stats), mudança de estrutura e backup. Tudo opcional."""
+    usage, ok = {}, False
+    try:
+        usage = {row[0]: (row[1], max([v for v in row[2:] if v is not None], default=None))
+                 for row in _q_all(sqlconsole.ACTIVITY_SQL_USAGE)}
+        ok = True
+    except Exception as exc:
+        log(f"[atividade] dm_db_index_usage_stats indisponível: {exc}")
+    try:
+        start = _iso(_q_all(sqlconsole.ACTIVITY_SQL_START)[0][0])
+    except Exception as exc:
+        start = None
+        log(f"[atividade] dm_os_sys_info indisponível: {exc}")
+    try:
+        backups = {n: d for n, d in _q_all(sqlconsole.ACTIVITY_SQL_BACKUP)}
+    except Exception as exc:
+        backups = {}
+        log(f"[atividade] msdb.backupset indisponível: {exc}")
+    with STATUS_LOCK:
+        STATUS["server_start"] = start
+    for db in dbs:
+        try:
+            schema = _iso(_q_all(sqlconsole.ACTIVITY_SQL_SCHEMA, db)[0][0])
+        except Exception as exc:
+            schema = None
+            log(f"[{db}] modify_date indisponível: {exc}")
+        w, r = usage.get(db, (None, None))
+        set_status(db, activity_ok=ok, last_write=_iso(w), last_read=_iso(r),
+                   last_schema_change=schema, last_backup=_iso(backups.get(db)), activity_at=now())
+
+
 def refresh_sizes():
     with STATUS_LOCK:
         dbs = list(STATUS["databases"].keys())
     collect_sizes(dbs)
+    try:
+        collect_activity(dbs)
+    except Exception as exc:
+        log(f"[atividade] falha: {exc}")
     write_index()
 
 
@@ -474,6 +521,10 @@ def run_cycle():
             collect_sizes(dbs)
         except Exception as exc:
             log(f"[tamanho] falha: {exc}")
+        try:
+            collect_activity(dbs)
+        except Exception as exc:
+            log(f"[atividade] falha: {exc}")
         write_index()
         with ThreadPoolExecutor(max_workers=max(1, CFG["parallel"])) as pool:
             list(pool.map(document_database, dbs))
@@ -530,11 +581,14 @@ def _write_index():
             links.append(f'<a href="{base}schemaspy.log">log</a>')
         state = s.get("state", "?")
         sinfo = sqlconsole.size_info(s)
+        atext, atip, inactive = sqlconsole.activity_info(s, snap.get("server_start"))
+        aflag = '<div><span class="b wait">possivelmente inativo</span></div>' if inactive else ""
         err = f'<div class="err-msg">{html.escape(s["error"])}</div>' if s.get("error") else ""
         rows.append(
             f'<tr><td class="ck"><input type="checkbox" class="sel" value="{html.escape(db)}" aria-label="Selecionar {html.escape(db)}"></td>'
             f"<td><strong>{html.escape(db)}</strong>{err}</td>"
             f'<td class="n" title="{html.escape(sinfo[1])}">{html.escape(sinfo[0])}</td>'
+            f'<td class="act{" inat" if inactive else ""}" title="{html.escape(atip)}">{html.escape(atext)}{aflag}</td>'
             f'<td><span class="b {BADGE.get(state, "wait")}">{html.escape(state)}</span></td>'
             f"<td class='n'>{s.get('tables') if s.get('tables') is not None else ''}</td>"
             f"<td class='n'>{s.get('views') if s.get('views') is not None else ''}</td>"
@@ -561,6 +615,7 @@ tr:last-child td{{border-bottom:0}} a{{color:var(--run)}}
 .tools{{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:0 0 10px}} .m2{{color:var(--mu);font-size:13px}}
 button{{font:inherit;color:inherit;background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:5px 10px;cursor:pointer}}
 button.pri{{background:var(--run);color:#fff;border-color:var(--run)}} button:disabled{{opacity:.5;cursor:default}} td.ck,th.ck{{width:28px}}
+td.act{{font-size:13px}} td.inat{{color:var(--mu);background:rgba(128,128,128,.08)}}
 .err-msg{{color:var(--err);font-size:12px;margin-top:4px;max-width:420px}}
 </style></head><body><main>
 <h1>{html.escape(CFG['title'])}</h1>
@@ -569,10 +624,10 @@ button.pri{{background:var(--run);color:#fff;border-color:var(--run)}} button:di
 Estrutura e amostras de {CFG['sample_rows']} linhas por tabela (colunas sensíveis mascaradas).</p>
 <div class="tools"><button type="button" id="all">Marcar todos</button>
 <label><input type="checkbox" id="json"> incluir JSON de metadados</label>
-<button type="button" id="sz" title="Relê só o tamanho dos bancos, sem nova varredura">Atualizar tamanhos</button>
+<button type="button" id="sz" title="Relê só tamanho e atividade dos bancos, sem nova varredura">Atualizar tamanhos e atividade</button>
 <button type="button" id="dl" class="pri" disabled>Baixar .md selecionados</button> <span id="cnt" class="m2">0 selecionados</span></div>
-<div class="wrap"><table><thead><tr><th class="ck"></th><th>Banco</th><th>Tamanho</th><th>Situação</th><th>Tabelas</th><th>Views</th><th>Atualizado</th><th>Documentação</th></tr></thead>
-<tbody>{''.join(rows) or '<tr><td colspan="8">Listando bancos…</td></tr>'}</tbody></table></div>
+<div class="wrap"><table><thead><tr><th class="ck"></th><th>Banco</th><th>Tamanho</th><th title="Baseado em estatísticas que zeram quando o SQL Server reinicia">Última atividade</th><th>Situação</th><th>Tabelas</th><th>Views</th><th>Atualizado</th><th>Documentação</th></tr></thead>
+<tbody>{''.join(rows) or '<tr><td colspan="9">Listando bancos…</td></tr>'}</tbody></table></div>
 </main><script>
 const KEY='dbdoc-sel',boxes=[...document.querySelectorAll('.sel')],dl=document.getElementById('dl'),all=document.getElementById('all');
 const saved=new Set(JSON.parse(localStorage.getItem(KEY)||'[]'));boxes.forEach(b=>b.checked=saved.has(b.value));
@@ -784,7 +839,7 @@ def load_previous():
             if st.get("state") in ("executando", "na fila"):
                 st["state"] = "interrompido"
             STATUS["databases"][db] = st
-        for k in ("started", "finished", "finished_ts"):
+        for k in ("started", "finished", "finished_ts", "server_start"):
             if old.get(k) is not None:
                 STATUS[k] = old[k]
         STATUS["running"] = False

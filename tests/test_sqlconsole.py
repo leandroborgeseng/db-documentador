@@ -223,3 +223,42 @@ class Sizes(unittest.TestCase):
         self.assertEqual(t, "1,5 GB")
         self.assertEqual(tip, "Dados: 1,0 GB · Log: 512 MB")
         self.assertEqual(size_info({"size_data_mb": 100, "size_log_mb": None})[0], "100 MB")
+
+
+import datetime as _dt  # noqa: E402
+from sqlconsole import activity_info, fmt_dt  # noqa: E402
+
+NOW = _dt.datetime(2026, 10, 23, 12, 0)
+
+
+class Activity(unittest.TestCase):
+    def test_fmt(self):
+        self.assertEqual(fmt_dt("2026-10-01T08:05:00"), "01/10/2026 08:05")
+        self.assertEqual(fmt_dt(None), "—")
+        self.assertEqual(fmt_dt("lixo"), "—")
+
+    def test_no_permission(self):
+        t, tip, inact = activity_info({"activity_ok": False}, None, NOW)
+        self.assertEqual(t, "—")
+        self.assertIn("VIEW SERVER STATE", tip)
+        self.assertFalse(inact)
+
+    def test_recent_write(self):
+        t, tip, inact = activity_info({"activity_ok": True, "last_write": "2026-10-20T10:00:00",
+                                       "last_read": "2026-10-23T09:00:00"}, "2026-01-01T00:00:00", NOW)
+        self.assertIn("há 3 dias", t)
+        self.assertIn("Última leitura: 23/10/2026 09:00", tip)
+        self.assertIn("zera quando o SQL Server reinicia", tip)
+        self.assertFalse(inact)
+
+    def test_old_write(self):
+        self.assertTrue(activity_info({"activity_ok": True, "last_write": "2026-06-01T00:00:00"}, None, NOW)[2])
+
+    def test_no_write_long_uptime(self):
+        t, _, inact = activity_info({"activity_ok": True}, "2026-08-01T00:00:00", NOW)
+        self.assertIn("sem escrita desde que o servidor ligou em 01/08/2026", t)
+        self.assertTrue(inact)
+
+    def test_no_write_recent_restart(self):
+        self.assertFalse(activity_info({"activity_ok": True}, "2026-10-10T00:00:00", NOW)[2])
+        self.assertFalse(activity_info({"activity_ok": True}, None, NOW)[2])

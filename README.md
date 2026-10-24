@@ -101,6 +101,17 @@ No início de cada varredura o documentador lê o tamanho de dados e de log de c
 `sys.database_files` em cada banco; se ambos falharem, mostra "—"). O total aparece na coluna **Tamanho** da página inicial (dica com dados/log)
 e no seletor de banco do console. Fica salvo no `status.json`. O botão **Atualizar tamanhos** (`POST /api/sizes`) relê só os tamanhos, sem nova varredura.
 
+## Última atividade (bancos possivelmente inativos)
+
+Junto com o tamanho (na varredura e no botão **Atualizar tamanhos e atividade**), o documentador lê, só leitura:
+última escrita e última leitura (`MAX(last_user_update)` e seek/scan/lookup de `sys.dm_db_index_usage_stats`, exige `VIEW SERVER STATE`),
+início do SQL Server (`sys.dm_os_sys_info`), última mudança de estrutura (`MAX(modify_date)` de `sys.objects`, sem objetos do sistema)
+e último backup completo (`msdb.dbo.backupset`, se houver leitura). Tudo fica no `status.json`; sem permissão, aparece "—".
+
+**Atenção:** essas estatísticas zeram quando o SQL Server reinicia. "Sem escrita desde que o servidor ligou em X" quer dizer só isso.
+O banco recebe o selo cinza **possivelmente inativo** quando não teve escrita desde que o servidor ligou e o servidor está ligado há mais de 30 dias,
+ou quando a última escrita tem mais de 90 dias. Para habilitar: `GRANT VIEW SERVER STATE TO dbdoc;` (e, opcional, `db_datareader` em `msdb` para os backups).
+
 ## Baixar .md selecionados
 
 Na página inicial, marque os bancos (ou "Marcar todos") e clique em **Baixar .md selecionados**. O `.zip` (`documentacao-md-AAAAMMDD.zip`) traz, por banco, os `.md` da pasta (`schema.md`, `amostras.md`), opcionalmente o `schema.json`, e um `LEIA-ME.md` pensado para entregar a uma IA. Endpoint: `GET /api/bundle?db=A&db=B[&json=1]` (com Basic auth).
