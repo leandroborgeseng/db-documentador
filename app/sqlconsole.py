@@ -8,28 +8,71 @@ import decimal
 import re
 import uuid
 
-BLOCKED = [
-    "INSERT", "UPDATE", "DELETE", "MERGE", "DROP", "ALTER", "CREATE", "TRUNCATE",
-    "EXEC", "EXECUTE", "GRANT", "REVOKE", "DENY", "INTO", "BACKUP", "RESTORE",
-    "SHUTDOWN", "DBCC", "OPENROWSET", "OPENQUERY", "OPENDATASOURCE",
-]
-_BLOCKED_RE = re.compile(r"\b(" + "|".join(BLOCKED) + r")\b", re.I)
-_PROC_RE = re.compile(r"\b(sp_|xp_)\w*", re.I)
-
-
 class QueryRejected(ValueError):
     pass
 
 
-def _scan(sql):
-    """Remove comentários e substitui literais/identificadores entre aspas por marcadores.
+# Palavras proibidas em qualquer ponto do lote (fora de strings/comentários/[ident]).
+BLOCKED = {
+    "INSERT", "UPDATE", "DELETE", "MERGE", "DROP", "ALTER", "CREATE", "TRUNCATE",
+    "GRANT", "REVOKE", "DENY", "INTO", "BACKUP", "RESTORE", "SHUTDOWN", "DBCC",
+    "OPENROWSET", "OPENQUERY", "OPENDATASOURCE", "OPENXML", "BULK", "KILL", "USE",
+    "WAITFOR", "BEGIN", "COMMIT", "ROLLBACK", "SAVE", "TRAN", "TRANSACTION", "CURSOR",
+    "GOTO", "RECONFIGURE", "CHECKPOINT", "GO", "RAISERROR", "THROW", "REVERT", "SETUSER",
+    "WRITETEXT", "UPDATETEXT",
+}
+# Palavras que iniciam instrução (mesmo sem ';').
+STARTERS = {"SELECT", "WITH", "DECLARE", "SET", "EXEC", "EXECUTE", "SHOW", "IF",
+            "WHILE", "PRINT", "RETURN", "BREAK", "CONTINUE"}
+ALLOWED_PROCS = {
+    "sp_help", "sp_helptext", "sp_helpindex", "sp_helpconstraint", "sp_columns", "sp_tables",
+    "sp_pkeys", "sp_fkeys", "sp_spaceused", "sp_who", "sp_who2", "sp_databases",
+    "sp_stored_procedures", "sp_server_info",
+}
+SET_OPTIONS = {
+    "NOCOUNT", "ROWCOUNT", "TEXTSIZE", "DATEFORMAT", "DATEFIRST", "LANGUAGE", "ARITHABORT",
+    "ARITHIGNORE", "QUOTED_IDENTIFIER", "CONCAT_NULL_YIELDS_NULL", "NUMERIC_ROUNDABORT",
+    "ANSI_NULLS", "ANSI_PADDING", "ANSI_WARNINGS", "ANSI_NULL_DFLT_ON", "ANSI_NULL_DFLT_OFF",
+    "ANSI_DEFAULTS", "LOCK_TIMEOUT", "STATISTICS", "FMTONLY", "NOEXEC", "PARSEONLY",
+    "SHOWPLAN_TEXT", "SHOWPLAN_ALL", "SHOWPLAN_XML", "DEADLOCK_PRIORITY", "XACT_ABORT",
+}
+SHOW_TRANSLATIONS = {
+    ("TABLES",): "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES "
+                 "ORDER BY TABLE_SCHEMA, TABLE_NAME",
+    ("DATABASES",): "SELECT name FROM sys.databases ORDER BY name",
+    ("VIEWS",): "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.VIEWS "
+                "ORDER BY TABLE_SCHEMA, TABLE_NAME",
+    ("PROCEDURES",): "SELECT ROUTINE_SCHEMA, ROUTINE_NAME, ROUTINE_TYPE FROM INFORMATION_SCHEMA.ROUTINES "
+                     "ORDER BY ROUTINE_SCHEMA, ROUTINE_NAME",
+}
+MAX_STATEMENTS = 50
 
-    Retorna (sql_sem_comentarios, esqueleto) — o esqueleto não tem conteúdo de strings.
+
+class Tok:
+    __slots__ = ("kind", "text", "start", "end")
+
+    def __init__(self, kind, text, start, end):
+        self.kind, self.text, self.start, self.end = kind, text, start, end
+
+    @property
+    def up(self):
+        return self.text.upper() if self.kind == "word" else ""
+
+    def __repr__(self):
+        return f"{self.kind}:{self.text}"
+
+
+def tokenize(sql):
+    """Quebra o SQL em tokens: word, var (@x), temp (#x), str, ident ([x] / "x"), num, op.
+
+    Comentários (-- e /* */ aninhados) são descartados. Lança QueryRejected se algo não fecha.
     """
-    out, skel = [], []
-    i, n = 0, len(sql)
+    toks, i, n = [], 0, len(sql)
     while i < n:
         c = sql[i]
+        if c.isspace():
+            i += 1
+            continue
         if sql.startswith("--", i):
             j = sql.find("\n", i)
             i = n if j < 0 else j
@@ -45,53 +88,240 @@ def _scan(sql):
                     j += 1
             if depth:
                 raise QueryRejected("Comentário /* sem fechamento.")
-            out.append(" "); skel.append(" ")
             i = j
             continue
-        if c in "'\"[":
+        if c in "'\"[" or (c in "Nn" and i + 1 < n and sql[i + 1] == "'"):
+            s = i
+            if c in "Nn":
+                i += 1
+                c = "'"
             close = "]" if c == "[" else c
             j = i + 1
             while True:
                 k = sql.find(close, j)
                 if k < 0:
                     raise QueryRejected("Texto ou identificador entre aspas sem fechamento.")
-                if k + 1 < n and sql[k + 1] == close:  # aspas escapadas ('' ou ]])
+                if k + 1 < n and sql[k + 1] == close:
                     j = k + 2
                     continue
                 break
-            out.append(sql[i:k + 1])
-            # identificadores [x] / "x" viram nome neutro; strings viram ''
-            skel.append(" '' " if c == "'" else " ident ")
+            toks.append(Tok("str" if c == "'" else "ident", sql[s:k + 1], s, k + 1))
             i = k + 1
             continue
-        out.append(c); skel.append(c)
+        if c.isalpha() or c in "_@#":
+            j = i + 1
+            while j < n and (sql[j].isalnum() or sql[j] in "_@#$"):
+                j += 1
+            kind = "var" if c == "@" else "temp" if c == "#" else "word"
+            toks.append(Tok(kind, sql[i:j], i, j))
+            i = j
+            continue
+        if c.isdigit() or (c == "." and i + 1 < n and sql[i + 1].isdigit()):
+            j = i + 1
+            while j < n and (sql[j].isalnum() or sql[j] in "."):
+                j += 1
+            toks.append(Tok("num", sql[i:j], i, j))
+            i = j
+            continue
+        toks.append(Tok("op", c, i, i + 1))
         i += 1
-    return "".join(out).strip(), "".join(skel)
+    return toks
+
+
+def split_statements(toks):
+    """Divide os tokens em instruções por ';' e por palavras que iniciam instrução (nível 0)."""
+    stmts, cur, depth = [], [], 0
+    for t in toks:
+        if t.kind == "op" and t.text == ";" and depth == 0:
+            if cur:
+                stmts.append(cur)
+            cur = []
+            continue
+        if t.kind == "op" and t.text == "(":
+            depth += 1
+        elif t.kind == "op" and t.text == ")":
+            depth = max(0, depth - 1)
+        if depth == 0 and cur and t.up in STARTERS and _starts_new(cur, t):
+            stmts.append(cur)
+            cur = []
+        cur.append(t)
+    if depth:
+        raise QueryRejected("Parênteses sem fechamento.")
+    if cur:
+        stmts.append(cur)
+    return stmts
+
+
+def _starts_new(cur, t):
+    first, prev = cur[0].up, cur[-1]
+    u = t.up
+    if u == "SELECT":
+        if prev.up in ("UNION", "ALL", "EXCEPT", "INTERSECT"):
+            return False
+        if first == "WITH" and not any(x.up == "SELECT" and _depth_at(cur, x) == 0 for x in cur):
+            return False  # SELECT principal de um CTE
+        if first == "DECLARE" and prev.kind == "op" and prev.text == "=":
+            return False
+        return True
+    if u == "SET":
+        return True
+    if u == "WITH":
+        return False  # WITH (NOLOCK) / opções; CTE após ';' é o caso normal
+    return True
+
+
+def _depth_at(cur, tok):
+    d = 0
+    for x in cur:
+        if x is tok:
+            return d
+        if x.kind == "op" and x.text == "(":
+            d += 1
+        elif x.kind == "op" and x.text == ")":
+            d -= 1
+    return d
+
+
+def _label(stmt, limit=60):
+    s = " ".join(t.text for t in stmt[:8])
+    return s if len(s) <= limit else s[:limit - 1] + "…"
+
+
+def _check_global(stmt):
+    for t in stmt:
+        u = t.up
+        if u in BLOCKED:
+            raise QueryRejected(f"Palavra-chave não permitida ({u}) na instrução: {_label(stmt)}")
+        if t.kind == "word" and t.text.lower().startswith("xp_"):
+            raise QueryRejected(f"Procedimento estendido não permitido: {t.text}.")
+        if t.kind == "word" and t.text.lower() in ("sp_executesql", "sp_execute", "sp_prepexec"):
+            raise QueryRejected(f"SQL dinâmico não permitido: {t.text}.")
+
+
+def _check_exec(stmt):
+    rest = stmt[1:]
+    if not rest or rest[0].kind not in ("word", "ident"):
+        raise QueryRejected(f"EXEC só é permitido para procedimentos de catálogo: {_label(stmt)}")
+    # nome possivelmente qualificado: [db.][schema.]proc
+    i, parts = 0, []
+    while i < len(rest):
+        t = rest[i]
+        if t.kind in ("word", "ident"):
+            parts.append(t.text.strip('[]"'))
+            i += 1
+            if i < len(rest) and rest[i].kind == "op" and rest[i].text == ".":
+                i += 1
+                while i < len(rest) and rest[i].kind == "op" and rest[i].text == ".":
+                    i += 1
+                continue
+            break
+        break
+    proc = parts[-1].lower() if parts else ""
+    if proc not in ALLOWED_PROCS:
+        raise QueryRejected(
+            f"EXEC não permitido para '{parts[-1] if parts else '?'}'. Permitidos: "
+            + ", ".join(sorted(ALLOWED_PROCS)) + ".")
+    for t in rest[i:]:
+        if t.kind in ("str", "num", "ident", "var"):
+            continue
+        if t.kind == "op" and t.text in (",", "=", ".", "-"):
+            continue
+        if t.kind == "word" and t.up not in STARTERS and t.up != "OUTPUT":
+            continue  # identificador sem aspas como argumento (ex.: sp_help Pessoa)
+        raise QueryRejected(f"Argumentos de {proc} devem ser literais: {_label(stmt)}")
+
+
+def _check_statement(stmt):
+    _check_global(stmt)
+    first = stmt[0]
+    u = first.up
+    if u == "SELECT":
+        return None
+    if u == "WITH":
+        if not any(t.up == "SELECT" and _depth_at(stmt, t) == 0 for t in stmt[1:]):
+            raise QueryRejected(f"WITH deve terminar em SELECT: {_label(stmt)}")
+        return None
+    if u == "DECLARE":
+        if len(stmt) < 3 or stmt[1].kind != "var":
+            raise QueryRejected(f"DECLARE só é permitido para variáveis @: {_label(stmt)}")
+        return None
+    if u == "SET":
+        if len(stmt) >= 2 and stmt[1].kind == "var":
+            return None
+        if len(stmt) >= 2 and stmt[1].up in SET_OPTIONS:
+            return None
+        raise QueryRejected(f"SET só é permitido para variáveis @ ou opções de sessão: {_label(stmt)}")
+    if u in ("EXEC", "EXECUTE"):
+        _check_exec(stmt)
+        return None
+    if u == "SHOW":
+        key = tuple(t.up for t in stmt[1:])
+        if key in SHOW_TRANSLATIONS:
+            return SHOW_TRANSLATIONS[key]
+        raise QueryRejected("SHOW aceito só como SHOW TABLES, SHOW VIEWS, SHOW PROCEDURES ou SHOW DATABASES. "
+                            "No SQL Server use INFORMATION_SCHEMA.TABLES ou EXEC sp_tables.")
+    if u == "PRINT":
+        return None
+    if first.kind == "temp":
+        raise QueryRejected("Tabelas temporárias (#) não são permitidas.")
+    raise QueryRejected(f"Instrução não permitida: {_label(stmt)}. "
+                        "Permitido: SELECT, WITH…SELECT, DECLARE @var, SET @var/opções, "
+                        "EXEC de procedimentos de catálogo (sp_help etc.) e SHOW TABLES.")
 
 
 def validate_query(sql):
-    """Valida e devolve a consulta sem comentários. Lança QueryRejected."""
+    """Valida o lote e devolve o SQL a executar (sem comentários). Lança QueryRejected."""
     if not sql or not sql.strip():
         raise QueryRejected("Consulta vazia.")
     if len(sql) > 100_000:
         raise QueryRejected("Consulta muito longa.")
-    clean, skel = _scan(sql)
-    skel = skel.strip()
-    # ponto e vírgula: só um no final é aceito
-    stripped = skel.rstrip().rstrip(";").rstrip()
-    if ";" in stripped:
-        raise QueryRejected("Só é permitida uma instrução por vez (';' seguido de outra instrução).")
-    if skel.endswith(";"):
-        clean = clean.rstrip().rstrip(";").rstrip()
-    if not re.match(r"^(SELECT|WITH)\b", stripped, re.I):
-        raise QueryRejected("Só são permitidas consultas que começam com SELECT ou WITH.")
-    m = _BLOCKED_RE.search(stripped)
-    if m:
-        raise QueryRejected(f"Palavra-chave não permitida: {m.group(1).upper()}.")
-    m = _PROC_RE.search(stripped)
-    if m:
-        raise QueryRejected(f"Chamada de procedimento não permitida: {m.group(0)}.")
-    return clean
+    toks = tokenize(sql)
+    if not toks:
+        raise QueryRejected("Consulta vazia.")
+    stmts = split_statements(toks)
+    if len(stmts) > MAX_STATEMENTS:
+        raise QueryRejected(f"Muitas instruções no lote (máximo {MAX_STATEMENTS}).")
+    out = []
+    for s in stmts:
+        repl = _check_statement(s)
+        out.append(repl if repl else _render(sql, s))
+    return ";\n".join(out)
+
+
+def _render(sql, stmt):
+    """Reconstrói a instrução a partir dos tokens (comentários removidos, espaçamento preservado)."""
+    parts, prev = [], None
+    for t in stmt:
+        if prev is not None:
+            gap = sql[prev.end:t.start]
+            parts.append("\n" if "\n" in gap else (" " if gap else ""))
+        parts.append(t.text)
+        prev = t
+    return "".join(parts)
+
+
+MAX_RESULT_SETS = 20
+
+
+def collect_result_sets(cur, max_rows, max_sets=MAX_RESULT_SETS):
+    """Lê todos os conjuntos de resultado do cursor (nextset). Compatível: columns/rows = 1º conjunto."""
+    sets = []
+    while True:
+        if cur.description:
+            columns = [c[0] or f"col{i + 1}" for i, c in enumerate(cur.description)]
+            rows = cur.fetchmany(max_rows + 1)
+            sets.append({
+                "columns": columns,
+                "rows": [[to_json_value(v) for v in r] for r in rows[:max_rows]],
+                "truncated": len(rows) > max_rows,
+            })
+            if len(sets) >= max_sets:
+                break
+        if not cur.nextset():
+            break
+    first = sets[0] if sets else {"columns": [], "rows": [], "truncated": False}
+    return {"columns": first["columns"], "rows": first["rows"],
+            "truncated": any(s["truncated"] for s in sets), "result_sets": sets}
 
 
 def to_json_value(v):
@@ -125,42 +355,87 @@ select,button,textarea{font:inherit;color:inherit;background:var(--card);border:
 button{cursor:pointer} button.pri{background:var(--run);color:#fff;border-color:var(--run)} button:disabled{opacity:.5;cursor:default}
 textarea{width:100%;box-sizing:border-box;min-height:200px;font:14px/1.4 ui-monospace,Consolas,monospace;resize:vertical}
 #info{color:var(--mu);font-size:13px} #err{color:var(--err);white-space:pre-wrap;margin:8px 0}
+h2{font-size:14px;font-weight:600;margin:16px 0 0;color:var(--mu)}
 .wrap{overflow:auto;max-height:65vh;background:var(--card);border:1px solid var(--bd);border-radius:10px;margin-top:8px}
 table{border-collapse:collapse;font:13px ui-monospace,Consolas,monospace} th,td{padding:4px 8px;border-bottom:1px solid var(--bd);text-align:left;white-space:nowrap;max-width:480px;overflow:hidden;text-overflow:ellipsis}
 th{position:sticky;top:0;background:var(--card)} td.null{color:var(--mu);font-style:italic}
 </style></head><body><main>
 <p><a href="/">← Documentação</a></p>
 <h1>Console SQL</h1>
-<p class="m">Somente leitura: uma consulta SELECT ou WITH por vez, sempre desfeita ao final. Resultado limitado a __MAX__ linhas e __TIMEOUT__ s.</p>
+<p class="m">Somente leitura, sempre desfeito ao final. Aceita lotes com várias instruções: SELECT, WITH…SELECT, DECLARE/SET @variável,
+SET NOCOUNT/ANSI_*/ROWCOUNT e EXEC de procedimentos de catálogo (sp_help, sp_helptext, sp_columns, sp_tables, sp_who…).
+No SQL Server não existe SHOW TABLES: use <code>SELECT * FROM INFORMATION_SCHEMA.TABLES</code> ou <code>EXEC sp_tables</code> (SHOW TABLES/VIEWS/PROCEDURES/DATABASES são traduzidos).
+Limite de __MAX__ linhas por resultado e __TIMEOUT__ s.</p>
 <div class="bar"><label for="db">Banco</label><select id="db"><option>Carregando…</option></select></div>
 <textarea id="q" spellcheck="false" placeholder="SELECT TOP 100 * FROM dbo.Tabela"></textarea>
 <div class="bar"><button class="pri" id="run">Executar (Ctrl+Enter)</button>
 <button id="csv" disabled>Exportar CSV</button><span id="info"></span></div>
 <div id="err" role="alert"></div>
-<div class="wrap" id="wrap" hidden><table id="t"></table></div>
+<div id="out"></div>
 </main><script>
 const $=id=>document.getElementById(id);let last=null;
 const saved=JSON.parse(localStorage.getItem('sqlconsole')||'{}'); if(saved.q) $('q').value=saved.q;
 fetch('/api/databases').then(r=>r.json()).then(d=>{const s=$('db');s.innerHTML='';
- (d.databases||[]).forEach(n=>{const o=document.createElement('option');o.textContent=n;s.appendChild(o)});
+ (d.databases||[]).forEach(n=>{const o=document.createElement('option');o.value=n;const z=(d.sizes||{})[n];
+  o.textContent=z&&z.text!=='—'?n+' ('+z.text+')':n;if(z)o.title=z.title;s.appendChild(o)});
  if(saved.db) s.value=saved.db; if(d.error) $('err').textContent=d.error;}).catch(e=>$('err').textContent='Falha ao listar bancos: '+e);
 async function run(){const b=$('run');if(b.disabled)return;b.disabled=true;$('err').textContent='';$('info').textContent='Executando…';
  localStorage.setItem('sqlconsole',JSON.stringify({db:$('db').value,q:$('q').value}));
  try{const r=await fetch('/api/sql',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({database:$('db').value,query:$('q').value})});
   const d=await r.json(); if(d.error){$('err').textContent=d.error;$('info').textContent='';return}
-  last=d;render(d);$('csv').disabled=false;
-  $('info').textContent=d.rows.length+' linha(s)'+(d.truncated?' — resultado truncado no limite':'')+' · '+d.elapsed_ms+' ms';
+  const sets=d.result_sets||[{columns:d.columns,rows:d.rows,truncated:d.truncated}];
+  last=sets;render(sets);$('csv').disabled=!sets.length;
+  const n=sets.reduce((a,x)=>a+x.rows.length,0);
+  $('info').textContent=(sets.length===1?'':sets.length+' conjuntos de resultado · ')+(sets.length?n+' linha(s)':'Executado sem resultado')+(d.truncated?' — resultado truncado no limite':'')+' · '+d.elapsed_ms+' ms';
  }catch(e){$('err').textContent='Erro de comunicação: '+e;$('info').textContent=''}finally{b.disabled=false}}
-function render(d){const t=$('t');t.innerHTML='';const h=t.createTHead().insertRow();
+function render(sets){const out=$('out');out.innerHTML='';sets.forEach((d,i)=>{
+ if(sets.length>1){const h2=document.createElement('h2');h2.textContent='Resultado '+(i+1)+' · '+d.rows.length+' linha(s)'+(d.truncated?' (truncado)':'');out.appendChild(h2)}
+ const w=document.createElement('div');w.className='wrap';const t=document.createElement('table');w.appendChild(t);out.appendChild(w);
+ const h=t.createTHead().insertRow();
  d.columns.forEach(c=>{const th=document.createElement('th');th.textContent=c;h.appendChild(th)});
  const tb=t.createTBody();d.rows.forEach(row=>{const tr=tb.insertRow();row.forEach(v=>{const td=tr.insertCell();
-  if(v===null){td.textContent='NULL';td.className='null'}else{td.textContent=String(v);td.title=String(v)}})});$('wrap').hidden=false}
+  if(v===null){td.textContent='NULL';td.className='null'}else{td.textContent=String(v);td.title=String(v)}})})})}
 function csvCell(v){if(v===null)return '';v=String(v);return /[";\n\r,]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v}
-$('csv').onclick=()=>{if(!last)return;const lines=[last.columns.map(csvCell).join(';')].concat(last.rows.map(r=>r.map(csvCell).join(';')));
+$('csv').onclick=()=>{if(!last||!last.length)return;const lines=[];last.forEach((x,i)=>{if(i)lines.push('');
+ lines.push(x.columns.map(csvCell).join(';'));x.rows.forEach(r=>lines.push(r.map(csvCell).join(';')))});
  const blob=new Blob(['\ufeff'+lines.join('\r\n')],{type:'text/csv;charset=utf-8'});const a=document.createElement('a');
  a.href=URL.createObjectURL(blob);a.download=($('db').value||'consulta')+'_'+new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')+'.csv';a.click();URL.revokeObjectURL(a.href)};
 $('run').onclick=run;$('q').addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key==='Enter'){e.preventDefault();run()}});
 </script></body></html>"""
+
+
+# ---------------------------------------------------------------- tamanho dos bancos
+
+SIZE_SQL_MASTER = (
+    "SELECT DB_NAME(database_id) AS db, "
+    "SUM(CASE WHEN type_desc='ROWS' THEN CAST(size AS bigint) END)*8/1024.0 AS data_mb, "
+    "SUM(CASE WHEN type_desc='LOG' THEN CAST(size AS bigint) END)*8/1024.0 AS log_mb "
+    "FROM sys.master_files GROUP BY database_id")
+SIZE_SQL_LOCAL = (
+    "SELECT SUM(CASE WHEN type_desc='ROWS' THEN CAST(size AS bigint) END)*8/1024.0 AS data_mb, "
+    "SUM(CASE WHEN type_desc='LOG' THEN CAST(size AS bigint) END)*8/1024.0 AS log_mb "
+    "FROM sys.database_files")
+
+
+def format_size_mb(mb):
+    """MB legível: '850 MB', '1,5 GB', '2,3 TB'; None vira '—'."""
+    if mb is None:
+        return "—"
+    mb = float(mb)
+    if mb >= 1024 * 1024:
+        return f"{mb / 1024 / 1024:.1f} TB".replace(".", ",")
+    if mb >= 1024:
+        return f"{mb / 1024:.1f} GB".replace(".", ",")
+    return f"{mb:.0f} MB" if mb >= 10 else f"{mb:.1f} MB".replace(".", ",")
+
+
+def size_info(st):
+    """(texto, tooltip) a partir de size_data_mb/size_log_mb do status."""
+    d, lg = st.get("size_data_mb"), st.get("size_log_mb")
+    if d is None and lg is None:
+        return "—", "Tamanho indisponível"
+    total = (d or 0) + (lg or 0)
+    return format_size_mb(total), f"Dados: {format_size_mb(d)} · Log: {format_size_mb(lg)}"
 
 
 # ---------------------------------------------------------------- amostras

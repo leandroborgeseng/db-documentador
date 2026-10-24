@@ -420,6 +420,42 @@ def document_database(db):
     set_status(db, state=state, finished=now(), error=" | ".join(errors) or None, **result)
 
 
+def collect_sizes(dbs):
+    """Tamanho (dados/log, MB) de cada banco: sys.master_files; se negado, sys.database_files por banco."""
+    sizes = {}
+    try:
+        with connect() as conn:
+            cur = conn.cursor()
+            cur.execute(sqlconsole.SIZE_SQL_MASTER)
+            for name, d, lg in cur.fetchall():
+                sizes[name] = (d, lg)
+    except Exception as exc:
+        log(f"[tamanho] sys.master_files indisponível: {exc}")
+    for db in dbs:
+        if db in sizes and any(v is not None for v in sizes[db]):
+            continue
+        try:
+            with connect(db) as conn:
+                cur = conn.cursor()
+                cur.execute(sqlconsole.SIZE_SQL_LOCAL)
+                sizes[db] = tuple(cur.fetchone() or (None, None))
+        except Exception as exc:
+            log(f"[{db}] tamanho indisponível: {exc}")
+            sizes.setdefault(db, (None, None))
+    for db in dbs:
+        d, lg = sizes.get(db, (None, None))
+        set_status(db, size_data_mb=None if d is None else round(float(d), 2),
+                   size_log_mb=None if lg is None else round(float(lg), 2), size_at=now())
+    return sizes
+
+
+def refresh_sizes():
+    with STATUS_LOCK:
+        dbs = list(STATUS["databases"].keys())
+    collect_sizes(dbs)
+    write_index()
+
+
 def run_cycle():
     with STATUS_LOCK:
         STATUS.update(started=now(), finished=None, running=True)
@@ -434,6 +470,10 @@ def run_cycle():
                 STATUS["databases"].setdefault(d, {"state": "na fila"})
                 if STATUS["databases"][d].get("state") != "ok":
                     STATUS["databases"][d]["state"] = "na fila"
+        try:
+            collect_sizes(dbs)
+        except Exception as exc:
+            log(f"[tamanho] falha: {exc}")
         write_index()
         with ThreadPoolExecutor(max_workers=max(1, CFG["parallel"])) as pool:
             list(pool.map(document_database, dbs))
@@ -489,10 +529,12 @@ def _write_index():
         if s.get("state") in ("erro", "parcial", "ok"):
             links.append(f'<a href="{base}schemaspy.log">log</a>')
         state = s.get("state", "?")
+        sinfo = sqlconsole.size_info(s)
         err = f'<div class="err-msg">{html.escape(s["error"])}</div>' if s.get("error") else ""
         rows.append(
             f'<tr><td class="ck"><input type="checkbox" class="sel" value="{html.escape(db)}" aria-label="Selecionar {html.escape(db)}"></td>'
             f"<td><strong>{html.escape(db)}</strong>{err}</td>"
+            f'<td class="n" title="{html.escape(sinfo[1])}">{html.escape(sinfo[0])}</td>'
             f'<td><span class="b {BADGE.get(state, "wait")}">{html.escape(state)}</span></td>'
             f"<td class='n'>{s.get('tables') if s.get('tables') is not None else ''}</td>"
             f"<td class='n'>{s.get('views') if s.get('views') is not None else ''}</td>"
@@ -527,9 +569,10 @@ button.pri{{background:var(--run);color:#fff;border-color:var(--run)}} button:di
 Estrutura e amostras de {CFG['sample_rows']} linhas por tabela (colunas sensíveis mascaradas).</p>
 <div class="tools"><button type="button" id="all">Marcar todos</button>
 <label><input type="checkbox" id="json"> incluir JSON de metadados</label>
+<button type="button" id="sz" title="Relê só o tamanho dos bancos, sem nova varredura">Atualizar tamanhos</button>
 <button type="button" id="dl" class="pri" disabled>Baixar .md selecionados</button> <span id="cnt" class="m2">0 selecionados</span></div>
-<div class="wrap"><table><thead><tr><th class="ck"></th><th>Banco</th><th>Situação</th><th>Tabelas</th><th>Views</th><th>Atualizado</th><th>Documentação</th></tr></thead>
-<tbody>{''.join(rows) or '<tr><td colspan="7">Listando bancos…</td></tr>'}</tbody></table></div>
+<div class="wrap"><table><thead><tr><th class="ck"></th><th>Banco</th><th>Tamanho</th><th>Situação</th><th>Tabelas</th><th>Views</th><th>Atualizado</th><th>Documentação</th></tr></thead>
+<tbody>{''.join(rows) or '<tr><td colspan="8">Listando bancos…</td></tr>'}</tbody></table></div>
 </main><script>
 const KEY='dbdoc-sel',boxes=[...document.querySelectorAll('.sel')],dl=document.getElementById('dl'),all=document.getElementById('all');
 const saved=new Set(JSON.parse(localStorage.getItem(KEY)||'[]'));boxes.forEach(b=>b.checked=saved.has(b.value));
@@ -540,6 +583,8 @@ boxes.forEach(b=>b.addEventListener('change',upd));
 all.onclick=()=>{{const on=!(boxes.length&&boxes.every(b=>b.checked));boxes.forEach(b=>b.checked=on);upd()}};
 dl.onclick=()=>{{const p=new URLSearchParams();boxes.filter(b=>b.checked).forEach(b=>p.append('db',b.value));
  if(document.getElementById('json').checked)p.set('json','1');location.href='/api/bundle?'+p}};upd();
+document.getElementById('sz').onclick=async e=>{{e.target.disabled=true;e.target.textContent='Atualizando…';
+ try{{await fetch('/api/sizes',{{method:'POST'}});setTimeout(()=>location.reload(),5000)}}catch(_){{e.target.disabled=false}}}};
 </script></body></html>"""
     tmp = os.path.join(CFG["output"], "index.html.tmp")
     with open(tmp, "w", encoding="utf-8") as f:
@@ -582,20 +627,20 @@ def run_console_query(database, query):
         cur.execute("BEGIN TRANSACTION")
         try:
             cur.execute(clean)
-            columns = [c[0] or f"col{i + 1}" for i, c in enumerate(cur.description or [])]
-            rows = cur.fetchmany(CFG["sql_max_rows"] + 1) if cur.description else []
+            result = sqlconsole.collect_result_sets(cur, CFG["sql_max_rows"])
         finally:
             try:
                 conn.rollback()
             except Exception:
                 pass
-        truncated = len(rows) > CFG["sql_max_rows"]
-        rows = [[sqlconsole.to_json_value(v) for v in r] for r in rows[:CFG["sql_max_rows"]]]
     finally:
         conn.close()
     ms = int((time.monotonic() - t0) * 1000)
-    log(f"[sql] db={database} rows={len(rows)}{'+' if truncated else ''} ms={ms} q={' '.join(query.split())[:200]!r}")
-    return {"columns": columns, "rows": rows, "truncated": truncated, "elapsed_ms": ms}
+    nrows = sum(len(x["rows"]) for x in result["result_sets"])
+    log(f"[sql] db={database} sets={len(result['result_sets'])} rows={nrows}{'+' if result['truncated'] else ''} "
+        f"ms={ms} q={' '.join(query.split())[:200]!r}")
+    result["elapsed_ms"] = ms
+    return result
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
@@ -649,7 +694,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             if not self._console_gate():
                 return
             if path == "/api/databases":
-                return self._send(200, {"databases": console_databases()})
+                with STATUS_LOCK:
+                    sizes = {d: sqlconsole.size_info(STATUS["databases"].get(d, {}))
+                             for d in console_databases()}
+                return self._send(200, {"databases": console_databases(),
+                                        "sizes": {d: {"text": t, "title": tt} for d, (t, tt) in sizes.items()}})
             if path == "/api/sql":
                 return self._send(405, {"error": "Use POST."})
             page = (sqlconsole.PAGE.replace("__MAX__", str(CFG["sql_max_rows"]))
@@ -682,6 +731,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
+        if path == "/api/sizes":
+            if not self._authorized():
+                return
+            threading.Thread(target=refresh_sizes, daemon=True).start()
+            return self._send(202, {"ok": True, "message": "Atualizando tamanhos; recarregue em alguns segundos."})
         if path != "/api/sql":
             return self._send(404, {"error": "Não encontrado."})
         if not self._console_gate():

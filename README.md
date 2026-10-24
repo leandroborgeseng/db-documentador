@@ -70,8 +70,20 @@ Baixe o `schema.md` dos bancos da saúde e mande para a IA junto com a especific
 ## Console SQL (`/sql`)
 
 Página para testar consultas: escolha o banco, escreva a consulta e execute (Ctrl+Enter); mostra linhas, tempo, erros e exporta CSV.
-Camadas de proteção: só uma instrução `SELECT`/`WITH` (comentários removidos; bloqueia `INSERT`, `UPDATE`, `DELETE`, `INTO`, `EXEC`, `sp_`/`xp_`, `OPENROWSET` etc. fora de strings);
-execução dentro de transação sempre desfeita; `LOCK_TIMEOUT` e timeout; limite de linhas; banco validado contra a lista. Cada consulta é registrada no log do container (sem credenciais).
+Aceita **lotes com várias instruções** (separadas por `;` ou por quebra de linha), por exemplo `DECLARE @x VARCHAR(10) = '001'; SELECT … WHERE c = @x;`.
+Cada instrução é validada por um analisador que ignora strings, `[identificadores]`, `"aspas"` e comentários (`--`, `/* */`):
+
+- **Permitido:** `SELECT` (inclusive `SELECT @var = …`), `WITH … SELECT`, `DECLARE @var` (escalares e `TABLE`), `SET @var = …`,
+  opções de sessão (`SET NOCOUNT`, `ANSI_*`, `ROWCOUNT`, `DATEFORMAT`, `STATISTICS`, `SHOWPLAN_*`…), `PRINT`,
+  `EXEC`/`EXECUTE` só de `sp_help`, `sp_helptext`, `sp_helpindex`, `sp_helpconstraint`, `sp_columns`, `sp_tables`, `sp_pkeys`,
+  `sp_fkeys`, `sp_spaceused`, `sp_who`, `sp_who2`, `sp_databases`, `sp_stored_procedures`, `sp_server_info` com argumentos literais.
+- **SHOW:** SQL Server não tem `SHOW TABLES`; use `INFORMATION_SCHEMA.TABLES` ou `EXEC sp_tables`. O console traduz `SHOW TABLES`, `SHOW VIEWS`, `SHOW PROCEDURES` e `SHOW DATABASES`.
+- **Bloqueado:** `INSERT`/`UPDATE`/`DELETE`/`MERGE` (inclusive em variáveis de tabela), `SELECT … INTO`, tabelas `#temp`, DDL (`CREATE`/`ALTER`/`DROP`/`TRUNCATE`),
+  `GRANT`/`REVOKE`/`DENY`, `EXEC` de qualquer outro procedimento, `sp_executesql`, `xp_*`, `OPENROWSET`/`OPENQUERY`/`OPENDATASOURCE`, `BULK`,
+  `BACKUP`/`RESTORE`, `DBCC`, `SHUTDOWN`, `KILL`, `USE`, `WAITFOR`, cursores, `IF`/`WHILE`/`BEGIN`, e comandos de transação. A mensagem de erro cita a instrução recusada.
+
+O lote roda numa transação sempre desfeita, com `LOCK_TIMEOUT`, timeout e limite de linhas **por conjunto de resultado**; todos os conjuntos são exibidos
+(a API devolve `result_sets` e mantém `columns`/`rows` do primeiro). Banco validado contra a lista. Cada consulta é registrada no log do container (sem credenciais).
 Mesmo assim, use um login só leitura:
 
 ```sql
@@ -82,6 +94,12 @@ ALTER ROLE db_datareader ADD MEMBER dbdoc_console;
 ```
 
 Testes do validador: `python3 -m unittest discover -s tests`.
+
+## Tamanho dos bancos
+
+No início de cada varredura o documentador lê o tamanho de dados e de log de cada banco (`sys.master_files`; se não houver permissão,
+`sys.database_files` em cada banco; se ambos falharem, mostra "—"). O total aparece na coluna **Tamanho** da página inicial (dica com dados/log)
+e no seletor de banco do console. Fica salvo no `status.json`. O botão **Atualizar tamanhos** (`POST /api/sizes`) relê só os tamanhos, sem nova varredura.
 
 ## Baixar .md selecionados
 

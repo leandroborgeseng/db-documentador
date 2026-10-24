@@ -30,8 +30,6 @@ class Blocked(unittest.TestCase):
     def test_delete(self): self.bad("DELETE FROM t")
     def test_select_into(self): self.bad("SELECT * INTO nova FROM t")
     def test_multi(self): self.bad("SELECT 1; DROP TABLE t")
-    def test_multi_select(self): self.bad("SELECT 1; SELECT 2")
-    def test_exec(self): self.bad("EXEC sp_who")
     def test_sp_in_select(self): self.bad("SELECT * FROM t; EXEC xp_cmdshell 'dir'")
     def test_xp(self): self.bad("SELECT xp_cmdshell")
     def test_openrowset(self): self.bad("SELECT * FROM OPENROWSET('SQLNCLI','x','select 1')")
@@ -42,10 +40,133 @@ class Blocked(unittest.TestCase):
     def test_unclosed_string(self): self.bad("SELECT 'abc")
     def test_dbcc(self): self.bad("DBCC CHECKDB")
     def test_shutdown(self): self.bad("SELECT 1 SHUTDOWN")
-    def test_declare(self): self.bad("DECLARE @a int SELECT 1")
     def test_waitfor_start(self): self.bad("WAITFOR DELAY '00:00:10'")
     def test_semicolon_in_comment_then_stmt(self): self.bad("SELECT 1 /* ; */ ; TRUNCATE TABLE t")
     def test_grant(self): self.bad("SELECT 1 GRANT SELECT ON t TO x")
+
+
+CEMITERIO = """-- Informe a localização da cova:
+DECLARE @Cemiterio VARCHAR(10) = '001';
+DECLARE @Quadra    VARCHAR(10) = '01';
+DECLARE @Sepultura VARCHAR(10) = '00006';
+
+SELECT
+    o.COD_CEMITERIO,
+    c.nomecemite AS CEMITERIO,
+    o.QUADRA, o.SEPULTURA, o.GAVETA, o.LADO, o.SEQUENCIA, o.FALECIDO,
+    o.DT_SEPULTADO, o.DT_MORTE, o.ATESTADO, o.OBSERVACAO, o.OBSERVACAO2
+FROM dbo.Obitos AS o
+LEFT JOIN dbo.Cemiterio AS c
+    ON c.codcemite = o.COD_CEMITERIO
+WHERE o.COD_CEMITERIO = @Cemiterio
+  AND o.QUADRA = @Quadra
+  AND o.SEPULTURA = @Sepultura
+ORDER BY
+    o.DT_SEPULTADO,
+    o.GAVETA,
+    o.LADO,
+    o.SEQUENCIA;
+"""
+
+
+class Batches(unittest.TestCase):
+    def ok(self, q):
+        return validate_query(q)
+
+    def bad(self, q, contains=None):
+        with self.assertRaises(QueryRejected) as cm:
+            validate_query(q)
+        if contains:
+            self.assertIn(contains, str(cm.exception))
+
+    def test_cemiterio(self):
+        out = self.ok(CEMITERIO)
+        self.assertEqual(out.count(";"), 3)
+        self.assertNotIn("Informe", out)
+        self.assertIn("ORDER BY", out)
+
+    def test_newline_separated(self):
+        out = self.ok("DECLARE @a int = 1\nSET @a = 2\nSELECT @a\nSELECT 2")
+        self.assertEqual(out.count(";"), 3)
+
+    def test_multi_select(self): self.assertEqual(self.ok("SELECT 1; SELECT 2").count(";"), 1)
+    def test_select_assign(self): self.ok("DECLARE @n int; SELECT @n = COUNT(*) FROM t; SELECT @n")
+    def test_table_var(self): self.ok("DECLARE @t TABLE (id int, nome varchar(10)); SELECT * FROM @t")
+    def test_declare_subquery(self): self.ok("DECLARE @n int = (SELECT MAX(id) FROM t) SELECT @n")
+    def test_set_options(self): self.ok("SET NOCOUNT ON; SET ANSI_WARNINGS OFF; SET ROWCOUNT 10; SELECT 1")
+    def test_comments(self): self.ok("/* cab */ SELECT 1; -- x\n/* DROP TABLE t; */ SELECT 2 -- DELETE")
+    def test_strings_semicolon(self): self.ok("SELECT 'a;b' AS x; SELECT * FROM t WHERE s = 'DELETE FROM t; DROP'")
+    def test_union(self): self.ok("SELECT 1 UNION ALL SELECT 2 UNION SELECT 3")
+    def test_cte_after_declare(self): self.ok("DECLARE @a int = 1; WITH x AS (SELECT @a a) SELECT * FROM x")
+    def test_order_desc_case_else(self): self.ok("SELECT CASE WHEN a=1 THEN 'x' ELSE 'y' END FROM t ORDER BY 1 DESC")
+    def test_offset_fetch(self): self.ok("SELECT * FROM t ORDER BY id OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY")
+    def test_nolock(self): self.ok("SELECT * FROM t WITH (NOLOCK)")
+    def test_sp_help(self): self.ok("EXEC sp_help 'dbo.Obitos'")
+    def test_sp_help_ident(self): self.ok("EXECUTE sys.sp_helptext N'dbo.vw'; EXEC sp_columns @table_name = 'Obitos'")
+    def test_sp_who(self): self.ok("EXEC sp_who2")
+    def test_show_tables(self): self.assertIn("INFORMATION_SCHEMA.TABLES", self.ok("SHOW TABLES;"))
+    def test_show_other(self): self.bad("SHOW GRANTS", "SHOW")
+
+    def test_sp_executesql(self): self.bad("EXEC sp_executesql N'SELECT 1'", "sp_executesql")
+    def test_exec_other(self): self.bad("EXEC dbo.LimpaTudo", "LimpaTudo")
+    def test_exec_dynamic(self): self.bad("EXEC ('DROP TABLE t')")
+    def test_exec_nested(self): self.bad("EXEC sp_help 'x', sp_executesql")
+    def test_select_into(self): self.bad("DECLARE @a int; SELECT * INTO nova FROM t", "INTO")
+    def test_drop_after(self): self.bad("SELECT 1; DROP TABLE t", "DROP")
+    def test_delete_newline(self): self.bad("SELECT 1\nDELETE FROM t", "DELETE")
+    def test_insert_tablevar(self): self.bad("DECLARE @t TABLE(a int); INSERT INTO @t VALUES (1)")
+    def test_temp_table(self): self.bad("SELECT 1 a INTO #t")
+    def test_cursor(self): self.bad("DECLARE c CURSOR FOR SELECT 1")
+    def test_tran(self): self.bad("BEGIN TRAN; SELECT 1")
+    def test_commit(self): self.bad("SELECT 1; COMMIT")
+    def test_use(self): self.bad("USE master; SELECT 1", "USE")
+    def test_set_identity(self): self.bad("SET IDENTITY_INSERT t ON", "SET")
+    def test_set_tran(self): self.bad("SET IMPLICIT_TRANSACTIONS ON")
+    def test_xp(self): self.bad("EXEC xp_cmdshell 'dir'", "xp_cmdshell")
+    def test_bulk(self): self.bad("SELECT * FROM OPENROWSET(BULK 'c:/x', SINGLE_CLOB) a")
+    def test_kill(self): self.bad("KILL 52")
+    def test_if(self): self.bad("IF 1=1 SELECT 1")
+    def test_unclosed_paren(self): self.bad("SELECT (1")
+
+
+from sqlconsole import collect_result_sets  # noqa: E402
+
+
+class FakeCursor:
+    def __init__(self, sets):
+        self.sets, self.i = sets, 0
+
+    @property
+    def description(self):
+        cols = self.sets[self.i][0]
+        return [(c,) for c in cols] if cols is not None else None
+
+    def fetchmany(self, n):
+        return self.sets[self.i][1][:n]
+
+    def nextset(self):
+        if self.i + 1 < len(self.sets):
+            self.i += 1
+            return True
+        return None
+
+
+class ResultSets(unittest.TestCase):
+    def test_multi(self):
+        cur = FakeCursor([(None, []), (["a"], [(1,), (2,), (3,)]), (None, []), (["", "b"], [(1, "x")])])
+        r = collect_result_sets(cur, max_rows=2)
+        self.assertEqual(len(r["result_sets"]), 2)
+        self.assertEqual(r["columns"], ["a"])
+        self.assertEqual(r["rows"], [[1], [2]])
+        self.assertTrue(r["truncated"])
+        self.assertEqual(r["result_sets"][1]["columns"], ["col1", "b"])
+        self.assertFalse(r["result_sets"][1]["truncated"])
+
+    def test_none(self):
+        r = collect_result_sets(FakeCursor([(None, [])]), max_rows=5)
+        self.assertEqual(r["result_sets"], [])
+        self.assertEqual(r["columns"], [])
+        self.assertEqual(r["rows"], [])
 
 
 class Serialize(unittest.TestCase):
@@ -83,3 +204,22 @@ class Samples(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+from sqlconsole import format_size_mb, size_info  # noqa: E402
+
+
+class Sizes(unittest.TestCase):
+    def test_format(self):
+        self.assertEqual(format_size_mb(None), "—")
+        self.assertEqual(format_size_mb(5.25), "5,2 MB")
+        self.assertEqual(format_size_mb(850), "850 MB")
+        self.assertEqual(format_size_mb(1536), "1,5 GB")
+        self.assertEqual(format_size_mb(3 * 1024 * 1024), "3,0 TB")
+
+    def test_info(self):
+        self.assertEqual(size_info({}), ("—", "Tamanho indisponível"))
+        t, tip = size_info({"size_data_mb": 1024, "size_log_mb": 512})
+        self.assertEqual(t, "1,5 GB")
+        self.assertEqual(tip, "Dados: 1,0 GB · Log: 512 MB")
+        self.assertEqual(size_info({"size_data_mb": 100, "size_log_mb": None})[0], "100 MB")
