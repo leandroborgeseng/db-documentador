@@ -22,6 +22,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import traceback
@@ -30,6 +31,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pymssql
 
 import bundle
+from secretmask import mask_secrets, sanitize_status
 import sqlconsole
 
 
@@ -52,7 +54,10 @@ CFG = {
     "parallel": int(env("PARALLEL", "2")),
     "every_hours": float(env("RUN_EVERY_HOURS", "168")),
     "java_opts": env("JAVA_OPTS", "-Xmx1g"),
-    "timeout_min": int(env("SCHEMASPY_TIMEOUT_MIN", "60")),
+    # SCHEMASPY_TIMEOUT_SECONDS tem prioridade; SCHEMASPY_TIMEOUT_MIN mantido por compatibilidade
+    "timeout_s": int(env("SCHEMASPY_TIMEOUT_SECONDS", "") or int(env("SCHEMASPY_TIMEOUT_MIN", "60")) * 60),
+    "timeout_large_s": int(env("SCHEMASPY_TIMEOUT_LARGE_SECONDS", "10800")),
+    "max_tables_full": int(env("SCHEMASPY_MAX_TABLES_FULL", "1500")),
     "extra_connprops": env("JDBC_CONNPROPS", "encrypt\\=false;trustServerCertificate\\=true"),
     "output": env("OUTPUT_DIR", "/output"),
     "port_http": int(env("PORT", "8080")),
@@ -77,7 +82,7 @@ STATUS = {"started": None, "finished": None, "running": False, "databases": {}}
 
 
 def log(msg):
-    print(f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
+    print(f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] {mask_secrets(msg)}", flush=True)
 
 
 def connect(database="master"):
@@ -307,26 +312,63 @@ def render_markdown(data):
 
 # ---------------------------------------------------------------- SchemaSpy
 
-def run_schemaspy(db, outdir):
+def schemaspy_plan(table_count):
+    """Bancos grandes (> SCHEMASPY_MAX_TABLES_FULL tabelas) rodam em modo leve com timeout estendido."""
+    large = table_count is not None and table_count > CFG["max_tables_full"]
+    if large:
+        # -degree 1: diagramas só com vizinhos diretos; -noimplied: sem relações implícitas
+        # (a parte mais cara em bancos com milhares de tabelas)
+        return {"large": True, "timeout": CFG["timeout_large_s"], "extra": ["-degree", "1", "-noimplied"]}
+    return {"large": False, "timeout": CFG["timeout_s"], "extra": []}
+
+
+def run_schemaspy(db, outdir, table_count=None):
     spy_dir = os.path.join(outdir, "schemaspy")
     shutil.rmtree(spy_dir, ignore_errors=True)
     os.makedirs(spy_dir, exist_ok=True)
-    cmd = ["java", *CFG["java_opts"].split(), "-jar", "/opt/schemaspy/schemaspy.jar",
-           "-t", "mssql08", "-dp", "/drivers/mssql-jdbc.jar",
-           "-host", CFG["host"], "-port", str(CFG["port"]), "-db", db,
-           "-u", CFG["user"], "-p", CFG["password"],
-           "-o", spy_dir, "-norows"]
-    if CFG["extra_connprops"]:
-        cmd += ["-connprops", CFG["extra_connprops"]]
-    if CFG["schemas"].strip().lower() == "all":
-        cmd += ["-all"]
-    else:
-        cmd += ["-schemas", CFG["schemas"]]
-    with open(os.path.join(outdir, "schemaspy.log"), "w", encoding="utf-8") as logf:
-        safe = [("***" if i > 0 and cmd[i - 1] == "-p" else a) for i, a in enumerate(cmd)]
-        logf.write(" ".join(safe) + "\n\n")
-        logf.flush()
-        proc = subprocess.run(cmd, stdout=logf, stderr=subprocess.STDOUT, timeout=CFG["timeout_min"] * 60)
+    plan = schemaspy_plan(table_count)
+    # A senha vai num arquivo de propriedades 0600 num diretório temporário (apagado no fim),
+    # nunca na linha de comando — assim não aparece em ps, exceções nem logs.
+    tmpdir = tempfile.mkdtemp(prefix="spy-")
+    props = os.path.join(tmpdir, "schemaspy.properties")
+    try:
+        fd = os.open(props, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as pf:
+            esc = CFG["password"].replace("\\", "\\\\")
+            pf.write(f"schemaspy.u={CFG['user']}\nschemaspy.p={esc}\n")
+        cmd = ["java", *CFG["java_opts"].split(), "-jar", "/opt/schemaspy/schemaspy.jar",
+               "-configFile", props,
+               "-t", "mssql08", "-dp", "/drivers/mssql-jdbc.jar",
+               "-host", CFG["host"], "-port", str(CFG["port"]), "-db", db,
+               "-o", spy_dir, "-norows", *plan["extra"]]
+        if CFG["extra_connprops"]:
+            cmd += ["-connprops", CFG["extra_connprops"]]
+        if CFG["schemas"].strip().lower() == "all":
+            cmd += ["-all"]
+        else:
+            cmd += ["-schemas", CFG["schemas"]]
+        logpath = os.path.join(outdir, "schemaspy.log")
+        with open(logpath, "w", encoding="utf-8") as logf:
+            logf.write(mask_secrets(" ".join(cmd)) + "\n")
+            logf.write(f"modo={'leve (banco grande)' if plan['large'] else 'completo'} timeout={plan['timeout']}s\n\n")
+            logf.flush()
+            try:
+                proc = subprocess.run(cmd, stdout=logf, stderr=subprocess.STDOUT, cwd=tmpdir,
+                                      timeout=plan["timeout"])
+            except subprocess.TimeoutExpired:
+                raise RuntimeError(f"SchemaSpy excedeu o limite de {plan['timeout']} s (veja schemaspy.log)") from None
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    # limpa eventual eco da senha na saída do SchemaSpy
+    try:
+        with open(logpath, encoding="utf-8", errors="replace") as f:
+            txt = f.read()
+        clean = mask_secrets(txt)
+        if clean != txt:
+            with open(logpath, "w", encoding="utf-8") as f:
+                f.write(clean)
+    except OSError:
+        pass
     if proc.returncode != 0:
         raise RuntimeError(f"SchemaSpy saiu com código {proc.returncode} (veja schemaspy.log)")
     # com -all o SchemaSpy cria um índice geral; sem -all, o index.html fica na raiz
@@ -335,6 +377,8 @@ def run_schemaspy(db, outdir):
 
 def set_status(db, **kwargs):
     with STATUS_LOCK:
+        if kwargs.get("error"):
+            kwargs["error"] = mask_secrets(kwargs["error"])
         STATUS["databases"].setdefault(db, {}).update(kwargs)
     write_index()
 
@@ -411,7 +455,7 @@ def document_database(db):
             errors.append(f"amostras: {exc}")
             log(f"[{db}] erro nas amostras: {exc}")
     try:
-        result["schemaspy"] = run_schemaspy(db, outdir)
+        result["schemaspy"] = run_schemaspy(db, outdir, result["tables"])
         log(f"[{db}] SchemaSpy ok")
     except Exception as exc:
         errors.append(f"SchemaSpy: {exc}")
@@ -532,7 +576,7 @@ def run_cycle():
         log(f"Falha no ciclo: {exc}")
         traceback.print_exc()
         with STATUS_LOCK:
-            STATUS["cycle_error"] = str(exc)
+            STATUS["cycle_error"] = mask_secrets(str(exc))
     finally:
         with STATUS_LOCK:
             STATUS.update(finished=now(), running=False)
@@ -583,7 +627,7 @@ def _write_index():
         sinfo = sqlconsole.size_info(s)
         atext, atip, inactive = sqlconsole.activity_info(s, snap.get("server_start"))
         aflag = '<div><span class="b wait">possivelmente inativo</span></div>' if inactive else ""
-        err = f'<div class="err-msg">{html.escape(s["error"])}</div>' if s.get("error") else ""
+        err = f'<div class="err-msg">{html.escape(mask_secrets(s["error"]))}</div>' if s.get("error") else ""
         rows.append(
             f'<tr><td class="ck"><input type="checkbox" class="sel" value="{html.escape(db)}" aria-label="Selecionar {html.escape(db)}"></td>'
             f"<td><strong>{html.escape(db)}</strong>{err}</td>"
@@ -812,6 +856,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             msg = args[1] if len(args) > 1 and isinstance(args[1], (bytes, str)) else str(e)
             if isinstance(msg, bytes):
                 msg = msg.decode("utf-8", "replace")
+            msg = mask_secrets(msg)
             log(f"[sql] erro: {msg[:300]}")
             self._send(400, {"error": msg[:2000]})
 
@@ -834,12 +879,15 @@ def load_previous():
             old = json.load(f)
     except Exception:
         return None
+    old, changed = sanitize_status(old)
+    if changed:
+        log("status.json continha senha em mensagens de erro; regravado mascarado")
     with STATUS_LOCK:
         for db, st in (old.get("databases") or {}).items():
             if st.get("state") in ("executando", "na fila"):
                 st["state"] = "interrompido"
             STATUS["databases"][db] = st
-        for k in ("started", "finished", "finished_ts", "server_start"):
+        for k in ("started", "finished", "finished_ts", "server_start", "cycle_error"):
             if old.get(k) is not None:
                 STATUS[k] = old[k]
         STATUS["running"] = False

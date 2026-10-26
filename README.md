@@ -49,8 +49,15 @@ O SQL Server precisa aceitar login SQL (modo de autenticação misto).
 | `SQL_CONSOLE_TIMEOUT` | `30` | Timeout (s) da consulta e `LOCK_TIMEOUT` |
 | `SQL_CONSOLE_MAX_ROWS` | `1000` | Máximo de linhas retornadas (o resto é marcado como truncado) |
 | `JAVA_OPTS` | `-Xmx1g` | Memória do SchemaSpy (aumente para bancos com milhares de tabelas) |
+| `SCHEMASPY_TIMEOUT_SECONDS` | `3600` | Limite do SchemaSpy por banco (substitui o antigo `SCHEMASPY_TIMEOUT_MIN`, que ainda é aceito) |
+| `SCHEMASPY_MAX_TABLES_FULL` | `1500` | Acima desse nº de tabelas o banco roda em **modo leve**: `-degree 1 -noimplied` (diagramas só com vizinhos diretos, sem relações implícitas) |
+| `SCHEMASPY_TIMEOUT_LARGE_SECONDS` | `10800` | Limite do SchemaSpy no modo leve (bancos grandes, ex.: DBSENIOR) |
 | `JDBC_CONNPROPS` | `encrypt\=false;trustServerCertificate\=true` | Propriedades do driver JDBC |
 | `SITE_TITLE` | `Documentação dos bancos` | Título da página |
+
+## Segurança da senha
+
+A senha do SQL Server nunca vai na linha de comando do SchemaSpy: ela é gravada num `schemaspy.properties` (permissão 0600) num diretório temporário apagado ao fim de cada execução (`-configFile`). Mensagens de erro, logs, `schemaspy.log`, `status.json` e o índice HTML passam por uma máscara (`-p X`, `password=X`, `Password=X`, `PWD=X` e o valor literal de `MSSQL_PASSWORD`/`SQL_CONSOLE_PASSWORD`/`BASIC_AUTH_PASSWORD` viram `***`). Ao iniciar, o `status.json` salvo no volume é regravado já mascarado.
 
 ## Vários servidores SQL Server
 
