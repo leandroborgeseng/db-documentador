@@ -60,7 +60,8 @@ class Mask(unittest.TestCase):
 
 class Auth(unittest.TestCase):
     CFG = {"admin_enabled": True, "admin_user": "admin", "admin_pass": FAKE,
-           "admin_sql_user": "dbdoc_admin_test", "admin_sql_pass": "Fake-Sql-1"}
+           "admin_sql_user": "dbdoc_admin_test", "admin_sql_pass": "Fake-Sql-1",
+           "admin_audit_log": "/audit/a.log", "output": "/output"}
 
     def test_ok(self): self.assertTrue(check_admin(self.CFG, "admin", FAKE))
     def test_bad(self):
@@ -189,8 +190,8 @@ class Routes(unittest.TestCase):
 
     def admin(self, **extra):
         return load_run(CONSOLE_ADMIN_ENABLED="true", CONSOLE_ADMIN_USER="admin",
-                        CONSOLE_ADMIN_PASSWORD="Fake-Admin-1", CONSOLE_ADMIN_AUDIT_LOG=self.audit,
-                        **{"CONSOLE_ADMIN_SQL_USER": "dbdoc_admin_test", "CONSOLE_ADMIN_SQL_PASSWORD": "Fake-Sql-1",
+                        CONSOLE_ADMIN_PASSWORD="Fake-Admin-1",
+                        **{"CONSOLE_ADMIN_AUDIT_LOG": self.audit, "CONSOLE_ADMIN_SQL_USER": "dbdoc_admin_test", "CONSOLE_ADMIN_SQL_PASSWORD": "Fake-Sql-1",
                            **extra})
 
     def body(self, **kw):
@@ -305,7 +306,8 @@ ALLOWED = [
     f"CREATE LOGIN x WITH PASSWORD = {PW}, DEFAULT_DATABASE = dbdoc_test",
     "CREATE USER x_ro FOR LOGIN x_ro",
     "CREATE USER x_ro FROM LOGIN x_ro WITH DEFAULT_SCHEMA = dbo",
-    "CREATE USER x_ro WITHOUT LOGIN",
+    f"CREATE LOGIN x WITH PASSWORD = {PW}, DEFAULT_DATABASE = master",
+    "ALTER ROLE DB_DATAREADER ADD MEMBER x_ro", "ALTER ROLE [db_datareader] ADD MEMBER [x_ro]",
     "CREATE USER x_ro",
     "ALTER ROLE db_datareader ADD MEMBER x_ro",
     "  alter   role [db_datareader]\n add\tmember [x_ro]  ",
@@ -450,12 +452,62 @@ class AdminSqlLogin(Routes):
         for q in ("DROP TABLE t", "GRANT CONTROL TO u", "CREATE USER a; DROP TABLE t", "EXEC sp_who",
                   "CREATE USER a -- x", "DELETE FROM t", "CREATE USER a;", "CREATE USER a\nGO",
                   "DROP DATABASE x", "TRUNCATE TABLE t", "EXEC sp_addsrvrolemember 'a','sysadmin'",
-                  "GRANT CONTROL SERVER TO x", "CREATE LOGIN a WITH PASSWORD='x'; DROP TABLE t"):
+                  "GRANT CONTROL SERVER TO x", "CREATE LOGIN a WITH PASSWORD='x'; DROP TABLE t",
+                  "ALTER ROLE db_owner ADD MEMBER x", "GRANT SELECT ON t TO x, public", "CREATE USER x WITHOUT LOGIN"):
             code, out = call(run, "POST", "/api/sql/admin/preview", self.body(query=q))
             self.assertEqual(code, 403, q)
             self.assertNotIn("token", out)
         self.assertEqual(issued, [])
         text = self.audit_text()
-        self.assertEqual(text.count('"event": "negado"'), 13)
+        self.assertEqual(text.count('"event": "negado"'), 16)
         self.assertNotIn('"event": "preview"', text)
         self.assertEqual(FakeConn.log, [])
+
+
+from consoleadmin import audit_inside_output  # noqa: E402
+
+
+class AuditLocation(Routes):
+    def test_inside_output(self):
+        out = os.path.join(self.tmp.name, "output")
+        os.makedirs(out)
+        self.assertTrue(audit_inside_output(os.path.join(out, "audit.log"), out))
+        self.assertTrue(audit_inside_output(os.path.join(out, "sub", "..", "a.log"), out))
+        self.assertTrue(audit_inside_output(out, out))
+        self.assertFalse(audit_inside_output(os.path.join(self.tmp.name, "audit", "a.log"), out))
+        self.assertFalse(audit_inside_output(out + "-x/a.log", out))
+        self.assertTrue(audit_inside_output("", out))
+
+    def test_symlink_into_output(self):
+        out = os.path.join(self.tmp.name, "output")
+        os.makedirs(out)
+        link = os.path.join(self.tmp.name, "audit")
+        os.symlink(out, link)
+        self.assertTrue(audit_inside_output(os.path.join(link, "a.log"), out))
+
+    def test_admin_off_when_audit_in_output(self):
+        out = os.path.join(self.tmp.name, "output")
+        os.makedirs(out)
+        link = os.path.join(self.tmp.name, "lnk")
+        os.symlink(out, link)
+        for path in (os.path.join(out, "a.log"), os.path.join(link, "a.log")):
+            run = self.admin(OUTPUT_DIR=out, CONSOLE_ADMIN_AUDIT_LOG=path)
+            self.assertIn("OUTPUT_DIR", consoleadmin_problem(run))
+            self.assertEqual(call(run, "POST", "/api/sql/admin/preview", self.body())[0], 404)
+            self.assertIn("const ADMIN=false", call(run, "GET", "/sql")[1])
+        run = self.admin(OUTPUT_DIR=out)
+        self.assertIsNone(consoleadmin_problem(run))
+
+    def test_startup_log_reason(self):
+        out = os.path.join(self.tmp.name, "output")
+        run = self.admin(OUTPUT_DIR=out, CONSOLE_ADMIN_AUDIT_LOG=os.path.join(out, "a.log"))
+        logs = []
+        run.log = logs.append
+        run.load_previous = lambda: (_ for _ in ()).throw(SystemExit)
+        with self.assertRaises(SystemExit):
+            run.main()
+        self.assertTrue(any("DESLIGADO" in m and "OUTPUT_DIR" in m for m in logs), logs)
+
+
+def consoleadmin_problem(run):
+    return run.consoleadmin.admin_problem(run.CFG)

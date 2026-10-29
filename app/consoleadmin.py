@@ -63,7 +63,20 @@ def admin_problem(cfg):
         return "CONSOLE_ADMIN_SQL_USER/CONSOLE_ADMIN_SQL_PASSWORD ausentes (não há fallback para MSSQL_USER)"
     if forbidden_sql_user(cfg["admin_sql_user"]):
         return "CONSOLE_ADMIN_SQL_USER não pode ser o login 'sistema'"
+    if audit_inside_output(cfg.get("admin_audit_log"), cfg.get("output")):
+        return "CONSOLE_ADMIN_AUDIT_LOG fica dentro de OUTPUT_DIR (seria servido pela web)"
     return None
+
+
+def audit_inside_output(audit_path, output_dir):
+    """True se o log de auditoria (resolvendo symlinks) cair dentro do diretório servido. Sem caminho, recusa."""
+    if not audit_path:
+        return True
+    if not output_dir:
+        return False
+    a = os.path.realpath(audit_path)
+    o = os.path.realpath(output_dir)
+    return a == o or a.startswith(o.rstrip(os.sep) + os.sep)
 
 
 def admin_active(cfg):
@@ -145,8 +158,8 @@ class AdminRejected(ValueError):
     """Instrução fora da lista permitida do modo administrador (vira 403 + auditoria)."""
 
 
-ALLOWED_DESC = ("Permitido no modo administrador, uma instrução por vez: CREATE LOGIN, CREATE USER, "
-                "ALTER ROLE <papel> ADD MEMBER <usuário> e GRANT SELECT (objeto, schema ou banco).")
+ALLOWED_DESC = ("Permitido no modo administrador, uma instrução por vez: CREATE LOGIN, CREATE USER (com login), "
+                "ALTER ROLE db_datareader ADD MEMBER <usuário> e GRANT SELECT (objeto, schema ou banco, não para public).")
 _FORBIDDEN = {"INSERT", "UPDATE", "DELETE", "MERGE", "TRUNCATE", "DROP", "EXEC", "EXECUTE", "DENY",
               "REVOKE", "USE", "GO", "OPENROWSET", "OPENQUERY", "OPENDATASOURCE", "BULK", "SHUTDOWN",
               "DBCC", "KILL", "BEGIN", "COMMIT", "ROLLBACK", "INTO", "SELECT", "DECLARE", "SET", "CONTROL",
@@ -233,9 +246,8 @@ def _create_user(p):
     if p.done():
         return
     if p.is_word("WITHOUT"):
-        p.word("WITHOUT")
-        p.word("LOGIN")
-    elif p.is_word("FOR", "FROM"):
+        raise AdminRejected("CREATE USER ... WITHOUT LOGIN não é permitido.")
+    if p.is_word("FOR", "FROM"):
         p.i += 1
         p.word("LOGIN")
         p.name()
@@ -257,10 +269,17 @@ def _grant(p):
             p.op(":")
         p.name(qualified=True)
     p.word("TO")
-    p.name()
+    _grantee(p)
     while p.is_op(","):
         p.i += 1
-        p.name()
+        _grantee(p)
+
+
+def _grantee(p):
+    t = p.peek()
+    if t is not None and t.kind in ("word", "ident") and t.text.strip('[]"').strip().lower() == "public":
+        raise AdminRejected("GRANT SELECT para public não é permitido.")
+    p.name()
 
 
 def _is_op_at(self, k, ch):
@@ -313,7 +332,10 @@ def validate_admin_query(sql):
             _create_user(p)
     elif first == "ALTER":
         p.word("ROLE")
-        p.name()
+        t = p.peek()
+        if t is None or t.kind not in ("word", "ident") or t.text.strip('[]"').lower() != "db_datareader":
+            raise AdminRejected("ALTER ROLE só é permitido para o papel db_datareader.")
+        p.i += 1
         p.word("ADD")
         p.word("MEMBER")
         p.name()
