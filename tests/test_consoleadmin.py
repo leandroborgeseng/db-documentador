@@ -36,6 +36,16 @@ class Mask(unittest.TestCase):
         # mensagem cortada no meio da senha (foi assim que vazou)
         self.assertNotIn("Fake", mask_secrets("instrução: CREATE LOGIN a WITH PASSWORD = 'Fake-P…"))
 
+    def test_hex_hashed(self):
+        for q in ("CREATE LOGIN a WITH PASSWORD = 0x0200ABCDEF HASHED",
+                  "alter login a with password=0x0200abcdef hashed, CHECK_POLICY = OFF",
+                  "erro perto de PASSWORD = 0x0200ABCD"):
+            out = mask_secrets(q)
+            self.assertNotIn("0200", out, q)
+            self.assertIn("'***'", out)
+        self.assertEqual(mask_secrets("CREATE LOGIN a WITH PASSWORD = 0x0200ABCDEF HASHED, CHECK_POLICY = OFF"),
+                         "CREATE LOGIN a WITH PASSWORD = '***' HASHED, CHECK_POLICY = OFF")
+
     def test_extra_and_noop(self):
         self.assertEqual(mask_secrets(f"erro {FAKE} aqui", [FAKE]), "erro *** aqui")
         self.assertEqual(mask_secrets("SELECT password_hash FROM t"), "SELECT password_hash FROM t")
@@ -290,7 +300,7 @@ from consoleadmin import validate_admin_query, AdminRejected  # noqa: E402
 PW = "'Fake-Pw-123'"
 ALLOWED = [
     f"CREATE LOGIN sigpmf_educacao_ro WITH PASSWORD = {PW}",
-    f"create login [x_ro] with password={PW}, CHECK_POLICY = ON, CHECK_EXPIRATION = OFF;",
+    f"create login [x_ro] with password={PW}, CHECK_POLICY = ON, CHECK_EXPIRATION = OFF",
     f"CREATE LOGIN x WITH PASSWORD = {PW} MUST_CHANGE, CHECK_EXPIRATION = ON",
     f"CREATE LOGIN x WITH PASSWORD = {PW}, DEFAULT_DATABASE = dbdoc_test",
     "CREATE USER x_ro FOR LOGIN x_ro",
@@ -298,7 +308,7 @@ ALLOWED = [
     "CREATE USER x_ro WITHOUT LOGIN",
     "CREATE USER x_ro",
     "ALTER ROLE db_datareader ADD MEMBER x_ro",
-    "  alter   role [db_datareader]\n add\tmember [x_ro] ; ",
+    "  alter   role [db_datareader]\n add\tmember [x_ro]  ",
     "GRANT SELECT ON dbo.Aluno TO x_ro",
     "GRANT SELECT ON OBJECT::dbo.Aluno TO x_ro",
     "GRANT SELECT ON SCHEMA::dbo TO x_ro, y_ro",
@@ -329,7 +339,10 @@ BLOCKED = [
     "GRANT SELECT ON t TO u; GRANT CONTROL TO u", "CREATE LOGIN a FROM CERTIFICATE c",
     "SHUTDOWN", "", "   ;  ", "CREATE USER a; ;",
     "CREATE LOGIN [DOM\\leandro] FROM WINDOWS", "create login x from windows with default_database = d",
-    "CREATE LOGIN a WITH PASSWORD = 'x', SID = 0x01", "CREATE LOGIN a WITH PASSWORD = 'x', sid=0x1234",
+    "CREATE LOGIN a WITH PASSWORD = 'x', SID = 0x01", "CREATE USER a;", "CREATE USER a ; ",
+    "DROP DATABASE x", "EXEC sp_addsrvrolemember 'a','sysadmin'", "GRANT CONTROL SERVER TO x",
+    "CREATE LOGIN a WITH PASSWORD='x'; DROP TABLE t", "CREATE LOGIN a WITH PASSWORD = 0x0200ABCDEF HASHED",
+    "GRANT SELECT ON t TO u\nGO", "GRANT SELECT ON t TO u /**/", "CREATE LOGIN a WITH PASSWORD = 'x', sid=0x1234",
 ]
 
 
@@ -345,8 +358,15 @@ class AdminScope(unittest.TestCase):
                 with self.assertRaises(AdminRejected):
                     validate_admin_query(q)
 
-    def test_strips_trailing_semicolon(self):
-        self.assertEqual(validate_admin_query("CREATE USER a ;"), "CREATE USER a")
+    def test_trims_whitespace(self):
+        self.assertEqual(validate_admin_query("  CREATE USER a \n"), "CREATE USER a")
+
+    def test_c1_cases_rejected(self):
+        for q in ("DROP DATABASE x", "DELETE FROM t", "TRUNCATE TABLE t",
+                  "EXEC sp_addsrvrolemember 'a','sysadmin'", "GRANT CONTROL SERVER TO x",
+                  "CREATE LOGIN a WITH PASSWORD='x'; DROP TABLE t"):
+            with self.subTest(q=q), self.assertRaises(AdminRejected):
+                validate_admin_query(q)
 
 
 class AdminScopeRoutes(Routes):
@@ -410,18 +430,32 @@ class AdminSqlLogin(Routes):
                                   self.body(token="x", confirm=True))[0], 404, u)
         self.assertEqual(FakeConn.log, [])
 
+    def test_hex_hash_masked_everywhere(self):
+        run = self.admin()
+        logged = []
+        run.AUDIT.logger = logged.append
+        q = "CREATE LOGIN a WITH PASSWORD = 0x0200ABCDEF HASHED"
+        code, out = call(run, "POST", "/api/sql/admin/preview", self.body(query=q))
+        self.assertEqual(code, 403)
+        for text in (out["error"], self.audit_text(), " ".join(logged)):
+            self.assertNotIn("0200ABCDEF", text)
+        code, out = call(run, "POST", "/api/sql", {"database": "dbdoc_test", "query": q})
+        self.assertNotIn("0200ABCDEF", out["error"])
+
     def test_disallowed_refused_before_preview(self):
         run = self.admin()
         issued = []
         orig = run.ADMIN_TOKENS.issue
         run.ADMIN_TOKENS.issue = lambda *a: issued.append(a) or orig(*a)
         for q in ("DROP TABLE t", "GRANT CONTROL TO u", "CREATE USER a; DROP TABLE t", "EXEC sp_who",
-                  "CREATE USER a -- x", "DELETE FROM t"):
+                  "CREATE USER a -- x", "DELETE FROM t", "CREATE USER a;", "CREATE USER a\nGO",
+                  "DROP DATABASE x", "TRUNCATE TABLE t", "EXEC sp_addsrvrolemember 'a','sysadmin'",
+                  "GRANT CONTROL SERVER TO x", "CREATE LOGIN a WITH PASSWORD='x'; DROP TABLE t"):
             code, out = call(run, "POST", "/api/sql/admin/preview", self.body(query=q))
             self.assertEqual(code, 403, q)
             self.assertNotIn("token", out)
         self.assertEqual(issued, [])
         text = self.audit_text()
-        self.assertEqual(text.count('"event": "negado"'), 6)
+        self.assertEqual(text.count('"event": "negado"'), 13)
         self.assertNotIn('"event": "preview"', text)
         self.assertEqual(FakeConn.log, [])

@@ -21,7 +21,7 @@ import time
 # Aceita aspas simples (com '' escapado), aspas duplas, colchetes e texto cortado sem fechamento.
 _SECRET_RE = re.compile(
     r"""(?P<kw>\b(?:\w*?_)?(?:PASSWORD|SECRET)\b|\bIDENTIFIED\s+BY\b)(?P<sep>\s*=?\s*)"""
-    r"""(?P<val>N?'(?:[^']|'')*(?:'|$)|"(?:[^"]|"")*(?:"|$)|\[[^\]]*(?:\]|$))""",
+    r"""(?P<val>N?'(?:[^']|'')*(?:'|$)|"(?:[^"]|"")*(?:"|$)|\[[^\]]*(?:\]|$)|0x[0-9A-Fa-f]*(?:\s+HASHED\b)?)""",
     re.I,
 )
 
@@ -33,7 +33,10 @@ def mask_secrets(text, extra=()):
     """
     if not text:
         return text
-    text = _SECRET_RE.sub(lambda m: f"{m.group('kw')}{m.group('sep')}'***'", str(text))
+    def repl(m):
+        hashed = " HASHED" if re.search(r"HASHED$", m.group("val"), re.I) else ""
+        return f"{m.group('kw')}{m.group('sep')}'***'{hashed}"
+    text = _SECRET_RE.sub(repl, str(text))
     for s in extra:
         if s and len(s) >= 4:
             text = text.replace(s, "***")
@@ -287,8 +290,6 @@ def validate_admin_query(sql):
         prev_end = t.end
     if sql[prev_end:].strip():
         raise AdminRejected("Comentários não são permitidos no modo administrador.")
-    if toks and toks[-1].kind == "op" and toks[-1].text == ";":
-        toks = toks[:-1]
     if not toks:
         raise AdminRejected("Instrução vazia.")
     grant_select = (len(toks) > 1 and toks[0].kind == "word" and toks[0].text.upper() == "GRANT"
@@ -298,7 +299,7 @@ def validate_admin_query(sql):
         if grant_select and idx == 1:
             continue
         if t.kind == "op" and t.text == ";":
-            raise AdminRejected("Só uma instrução por execução.")
+            raise AdminRejected("';' não é permitido no modo administrador (uma instrução por execução, sem ponto e vírgula).")
         if t.kind in ("var", "temp"):
             raise AdminRejected("Variáveis e tabelas temporárias não são permitidas no modo administrador.")
         if u in _FORBIDDEN or u.startswith(("SP_", "XP_")):
