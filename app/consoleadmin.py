@@ -53,6 +53,62 @@ def forbidden_sql_user(name):
     return n in FORBIDDEN_SQL_USERS
 
 
+SISTEMA_MAX_DAYS = 7
+SP_TZ = "America/Sao_Paulo"
+
+
+def today_sp():
+    """Data de hoje em America/Sao_Paulo (substituível nos testes)."""
+    try:
+        from zoneinfo import ZoneInfo
+        return dt.datetime.now(ZoneInfo(SP_TZ)).date()
+    except Exception:  # sem tzdata: UTC-3 fixo
+        return (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=3)).date()
+
+
+def flag_true(value):
+    return str(value or "").strip().lower() in ("true", "1")
+
+
+def sistema_expiry(cfg):
+    """Data de CONSOLE_ADMIN_ALLOW_SISTEMA_ATE como date, ou None se ausente/inválida."""
+    raw = str(cfg.get("admin_allow_sistema_ate") or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+        return None
+    try:
+        return dt.date.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
+def sistema_release_problem(cfg, today=None):
+    """Motivo para recusar a liberação TEMPORÁRIA do login 'sistema', ou None se vale agora.
+
+    Reavaliado a cada requisição: quando a data passa, o modo admin desliga sem reiniciar.
+    O limite de 7 dias conta a partir da data de inicialização (cfg['admin_start_date']).
+    """
+    if not cfg.get("admin_allow_sistema"):
+        return "CONSOLE_ADMIN_ALLOW_SISTEMA desligado"
+    raw = str(cfg.get("admin_allow_sistema_ate") or "").strip()
+    if not raw:
+        return "CONSOLE_ADMIN_ALLOW_SISTEMA_ATE ausente"
+    exp = sistema_expiry(cfg)
+    if exp is None:
+        return "CONSOLE_ADMIN_ALLOW_SISTEMA_ATE inválida (use AAAA-MM-DD)"
+    today = today or today_sp()
+    start = cfg.get("admin_start_date") or today
+    if exp > start + dt.timedelta(days=SISTEMA_MAX_DAYS):
+        return f"CONSOLE_ADMIN_ALLOW_SISTEMA_ATE passa de {SISTEMA_MAX_DAYS} dias após a inicialização ({start.isoformat()})"
+    if exp < today:
+        return f"CONSOLE_ADMIN_ALLOW_SISTEMA_ATE vencida ({exp.isoformat()})"
+    return None
+
+
+def via_sistema(cfg):
+    """True quando o modo admin está usando o login 'sistema' pela liberação temporária válida."""
+    return forbidden_sql_user(cfg.get("admin_sql_user")) and sistema_release_problem(cfg) is None
+
+
 def admin_problem(cfg):
     """Motivo para o modo admin ficar desligado, ou None se pode ligar."""
     if not cfg.get("admin_enabled"):
@@ -62,7 +118,11 @@ def admin_problem(cfg):
     if not cfg.get("admin_sql_user") or not cfg.get("admin_sql_pass"):
         return "CONSOLE_ADMIN_SQL_USER/CONSOLE_ADMIN_SQL_PASSWORD ausentes (não há fallback para MSSQL_USER)"
     if forbidden_sql_user(cfg["admin_sql_user"]):
-        return "CONSOLE_ADMIN_SQL_USER não pode ser o login 'sistema'"
+        if not cfg.get("admin_allow_sistema"):
+            return "CONSOLE_ADMIN_SQL_USER não pode ser o login 'sistema'"
+        why = sistema_release_problem(cfg)
+        if why:
+            return f"CONSOLE_ADMIN_SQL_USER não pode ser o login 'sistema' (liberação temporária recusada: {why})"
     if audit_inside_output(cfg.get("admin_audit_log"), cfg.get("output")):
         return "CONSOLE_ADMIN_AUDIT_LOG fica dentro de OUTPUT_DIR (seria servido pela web)"
     return None

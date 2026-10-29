@@ -78,6 +78,10 @@ CFG = {
     "admin_sql_pass": env("CONSOLE_ADMIN_SQL_PASSWORD", ""),
     "admin_token_ttl": int(env("CONSOLE_ADMIN_TOKEN_TTL", "120")),
     "admin_audit_log": env("CONSOLE_ADMIN_AUDIT_LOG", "/audit/console-admin.log"),
+    # TEMPORÁRIO: libera o login 'sistema' como CONSOLE_ADMIN_SQL_USER até uma data (máx. 7 dias).
+    "admin_allow_sistema": consoleadmin.flag_true(env("CONSOLE_ADMIN_ALLOW_SISTEMA", "false")),
+    "admin_allow_sistema_ate": env("CONSOLE_ADMIN_ALLOW_SISTEMA_ATE", ""),
+    "admin_start_date": consoleadmin.today_sp(),
 }
 
 SYSTEM_DBS = {"master", "model", "msdb", "tempdb", "distribution", "ssisdb", "reportserver", "reportservertempdb"}
@@ -726,6 +730,21 @@ def _db_name(database):
     return dbs[database.lower()]
 
 
+def sistema_banner():
+    """Faixa de aviso (texto) quando o modo admin usa o login 'sistema'. Vazia nos demais casos."""
+    if not (consoleadmin.admin_active(CFG) and consoleadmin.via_sistema(CFG)):
+        return ""
+    exp = consoleadmin.sistema_expiry(CFG).strftime("%d/%m/%Y")
+    return ('<p id="sistema-banner" role="alert" style="border:2px solid var(--err);padding:8px;border-radius:8px">'
+            '<b>ATENÇÃO: login SQL <code>sistema</code> em uso (liberação temporária).</b> '
+            f'Expira em {exp} (fim do dia, America/Sao_Paulo). Depois disso o modo administrador desliga. '
+            'Troque para o login dedicado <code>dbdoc_console_admin</code>.</p>')
+
+
+def _audit_extra():
+    return {"via_sistema": True} if consoleadmin.via_sistema(CFG) else {}
+
+
 def run_admin_statement(database, query):
     """Executa uma instrução de escrita já confirmada (autocommit) com o login do modo admin."""
     t0 = time.monotonic()
@@ -816,7 +835,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 return self._send(405, {"error": "Use POST."})
             page = (sqlconsole.PAGE.replace("__MAX__", str(CFG["sql_max_rows"]))
                     .replace("__TIMEOUT__", str(CFG["sql_timeout"]))
-                    .replace("__ADMIN__", "true" if consoleadmin.admin_active(CFG) else "false"))
+                    .replace("__ADMIN__", "true" if consoleadmin.admin_active(CFG) else "false")
+                    .replace("__SISTEMA__", sistema_banner()))
             return self._send(200, page, "text/html; charset=utf-8")
         if not self._authorized():
             return
@@ -881,6 +901,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def _admin(self, path):
         """POST /api/sql/admin/preview e /api/sql/admin/confirm. Já passou pelo _console_gate."""
         if not consoleadmin.admin_active(CFG):
+            if CFG["admin_allow_sistema"] and consoleadmin.forbidden_sql_user(CFG["admin_sql_user"]):
+                AUDIT.write("negado", "", "", "", step=path.rsplit("/", 1)[-1], via_sistema=True,
+                            result="modo admin desligado: " + str(consoleadmin.admin_problem(CFG)))
             return self._send(404, {"error": "Modo administrador desligado."})
         try:
             n = int(self.headers.get("Content-Length") or 0)
@@ -894,34 +917,34 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         database = str(data.get("database") or "")
         step = "preview" if path.endswith("/preview") else "confirm"
         if not consoleadmin.check_admin(CFG, user, data.get("admin_password")):
-            AUDIT.write("negado", user, database, query, step=step, result="credencial inválida")
+            AUDIT.write("negado", user, database, query, **_audit_extra(), step=step, result="credencial inválida")
             return self._send(403, {"error": "Credencial de administrador inválida. O console continua somente leitura."})
         try:
             query = consoleadmin.validate_admin_query(query)
         except consoleadmin.AdminRejected as e:
-            AUDIT.write("negado", user, database, query, step=step, result="instrução fora da lista: " + str(e))
+            AUDIT.write("negado", user, database, query, **_audit_extra(), step=step, result="instrução fora da lista: " + str(e))
             return self._send(403, {"error": safe_msg(str(e))})
         try:
             database = _db_name(database)
         except sqlconsole.QueryRejected as e:
-            AUDIT.write("negado", user, database, query, step=step, result=str(e))
+            AUDIT.write("negado", user, database, query, **_audit_extra(), step=step, result=str(e))
             return self._send(400, {"error": safe_msg(str(e))})
         if step == "preview":
             token = ADMIN_TOKENS.issue(user, database, query)
-            AUDIT.write("preview", user, database, query, result="aguardando confirmação")
+            AUDIT.write("preview", user, database, query, **_audit_extra(), result="aguardando confirmação")
             return self._send(200, {"token": token, "database": database, "expires_in": CFG["admin_token_ttl"],
                                     "statement": safe_msg(query)})
         if data.get("confirm") is not True or not ADMIN_TOKENS.consume(data.get("token"), user, database, query):
-            AUDIT.write("negado", user, database, query, step=step,
+            AUDIT.write("negado", user, database, query, **_audit_extra(), step=step,
                         result="confirmação ausente, expirada ou de outra instrução")
             return self._send(403, {"error": "Confirmação inválida ou expirada. Pré-visualize de novo."})
         try:
             result = run_admin_statement(database, query)
         except Exception as e:
             msg = _err_text(e)
-            AUDIT.write("erro", user, database, query, result="erro", error=msg[:500])
+            AUDIT.write("erro", user, database, query, **_audit_extra(), result="erro", error=msg[:500])
             return self._send(400, {"error": msg[:2000]})
-        AUDIT.write("executado", user, database, query, result="ok", rowcount=result.get("rowcount"),
+        AUDIT.write("executado", user, database, query, **_audit_extra(), result="ok", rowcount=result.get("rowcount"),
                     elapsed_ms=result.get("elapsed_ms"))
         return self._send(200, result)
 
@@ -962,6 +985,10 @@ def main():
     if CFG["admin_enabled"]:
         problem = consoleadmin.admin_problem(CFG)
         log("Console: modo administrador " + ("LIGADO" if not problem else f"DESLIGADO ({problem})"))
+        if not problem and consoleadmin.via_sistema(CFG):
+            log("WARNING: modo administrador usando o login 'sistema' (CONSOLE_ADMIN_ALLOW_SISTEMA, TEMPORÁRIO) "
+                f"até {CFG['admin_allow_sistema_ate']} (America/Sao_Paulo). Troque para dbdoc_console_admin "
+                "e desligue a flag.")
     age = load_previous()
     write_index()
     threading.Thread(target=serve, daemon=True).start()
