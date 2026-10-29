@@ -731,8 +731,7 @@ def run_admin_statement(database, query):
     t0 = time.monotonic()
     conn = pymssql.connect(
         server=CFG["host"], port=CFG["port"],
-        user=CFG["admin_sql_user"] or CFG["sql_user"],
-        password=CFG["admin_sql_pass"] if CFG["admin_sql_user"] else CFG["sql_pass"],
+        user=CFG["admin_sql_user"], password=CFG["admin_sql_pass"],  # sem fallback para MSSQL_USER
         database=database, login_timeout=15, timeout=CFG["sql_timeout"], charset="UTF-8",
         autocommit=True,
     )
@@ -817,7 +816,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 return self._send(405, {"error": "Use POST."})
             page = (sqlconsole.PAGE.replace("__MAX__", str(CFG["sql_max_rows"]))
                     .replace("__TIMEOUT__", str(CFG["sql_timeout"]))
-                    .replace("__ADMIN__", "true" if CFG["admin_enabled"] else "false"))
+                    .replace("__ADMIN__", "true" if consoleadmin.admin_active(CFG) else "false"))
             return self._send(200, page, "text/html; charset=utf-8")
         if not self._authorized():
             return
@@ -870,7 +869,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             msg = safe_msg(str(e))
             log(f"[sql] recusada: {msg}")
             hint = (" Instruções de escrita só no modo administrador (CONSOLE_ADMIN_ENABLED)."
-                    if CFG["admin_enabled"] else "")
+                    if consoleadmin.admin_active(CFG) else "")
             self._send(400, {"error": msg + hint})
         except (ValueError, json.JSONDecodeError):
             self._send(400, {"error": "JSON inválido."})
@@ -881,7 +880,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def _admin(self, path):
         """POST /api/sql/admin/preview e /api/sql/admin/confirm. Já passou pelo _console_gate."""
-        if not CFG["admin_enabled"]:
+        if not consoleadmin.admin_active(CFG):
             return self._send(404, {"error": "Modo administrador desligado."})
         try:
             n = int(self.headers.get("Content-Length") or 0)
@@ -896,9 +895,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         step = "preview" if path.endswith("/preview") else "confirm"
         if not consoleadmin.check_admin(CFG, user, data.get("admin_password")):
             AUDIT.write("negado", user, database, query, step=step, result="credencial inválida")
-            msg = ("Modo administrador sem CONSOLE_ADMIN_USER/CONSOLE_ADMIN_PASSWORD configurados."
-                   if not consoleadmin.admin_configured(CFG) else "Credencial de administrador inválida.")
-            return self._send(403, {"error": msg + " O console continua somente leitura."})
+            return self._send(403, {"error": "Credencial de administrador inválida. O console continua somente leitura."})
         try:
             query = consoleadmin.validate_admin_query(query)
         except consoleadmin.AdminRejected as e:
@@ -962,6 +959,9 @@ def load_previous():
 
 def main():
     os.makedirs(CFG["output"], exist_ok=True)
+    if CFG["admin_enabled"]:
+        problem = consoleadmin.admin_problem(CFG)
+        log("Console: modo administrador " + ("LIGADO" if not problem else f"DESLIGADO ({problem})"))
     age = load_previous()
     write_index()
     threading.Thread(target=serve, daemon=True).start()

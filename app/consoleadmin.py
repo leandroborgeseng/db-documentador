@@ -40,8 +40,35 @@ def mask_secrets(text, extra=()):
     return text
 
 
+FORBIDDEN_SQL_USERS = {"sistema"}
+
+
+def forbidden_sql_user(name):
+    """True para logins proibidos no modo admin (sistema, DOMINIO\\sistema, sistema@dominio, [sistema])."""
+    n = str(name or "").strip().strip("[]").lower()
+    n = n.rsplit("\\", 1)[-1].split("@", 1)[0].strip("[]").strip()
+    return n in FORBIDDEN_SQL_USERS
+
+
+def admin_problem(cfg):
+    """Motivo para o modo admin ficar desligado, ou None se pode ligar."""
+    if not cfg.get("admin_enabled"):
+        return "CONSOLE_ADMIN_ENABLED desligado"
+    if not cfg.get("admin_user") or not cfg.get("admin_pass"):
+        return "CONSOLE_ADMIN_USER/CONSOLE_ADMIN_PASSWORD ausentes"
+    if not cfg.get("admin_sql_user") or not cfg.get("admin_sql_pass"):
+        return "CONSOLE_ADMIN_SQL_USER/CONSOLE_ADMIN_SQL_PASSWORD ausentes (não há fallback para MSSQL_USER)"
+    if forbidden_sql_user(cfg["admin_sql_user"]):
+        return "CONSOLE_ADMIN_SQL_USER não pode ser o login 'sistema'"
+    return None
+
+
+def admin_active(cfg):
+    return admin_problem(cfg) is None
+
+
 def admin_configured(cfg):
-    return bool(cfg.get("admin_enabled") and cfg.get("admin_user") and cfg.get("admin_pass"))
+    return admin_active(cfg)
 
 
 def check_admin(cfg, user, password):

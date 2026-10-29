@@ -50,7 +50,7 @@ O SQL Server precisa aceitar login SQL (modo de autenticação misto).
 | `SQL_CONSOLE_MAX_ROWS` | `1000` | Máximo de linhas retornadas (o resto é marcado como truncado) |
 | `CONSOLE_ADMIN_ENABLED` | `false` | Liga o **modo administrador** do console. Aceita só, uma instrução por vez: `CREATE LOGIN`, `CREATE USER`, `ALTER ROLE <papel> ADD MEMBER <usuário>` e `GRANT SELECT` (objeto, schema ou banco). Todo o resto (DML, DROP, EXEC/sp_*, outros ALTER/GRANT, WITH GRANT OPTION, DENY/REVOKE, USE, várias instruções, GO, comentários) é recusado com 403 e auditado. Desligado, o console continua só leitura, exatamente como antes |
 | `CONSOLE_ADMIN_USER` / `CONSOLE_ADMIN_PASSWORD` | (sem padrão) | Credencial própria do modo admin, pedida na tela a cada pré-visualização/confirmação, além do Basic auth. Sem ela, o modo admin nega tudo (403) |
-| `CONSOLE_ADMIN_SQL_USER` / `CONSOLE_ADMIN_SQL_PASSWORD` | (usa o login do console) | Login SQL usado nas escritas. Recomendado: um login com só as permissões necessárias |
+| `CONSOLE_ADMIN_SQL_USER` / `CONSOLE_ADMIN_SQL_PASSWORD` | (obrigatórios) | Login SQL dedicado das escritas. Sem eles o modo admin fica desligado (não usa `MSSQL_USER`). O login `sistema` é recusado (inclusive `DOMINIO\\sistema` e `sistema@dominio`) |
 | `CONSOLE_ADMIN_TOKEN_TTL` | `120` | Segundos para confirmar a instrução pré-visualizada |
 | `CONSOLE_ADMIN_AUDIT_LOG` | `/audit/console-admin.log` | Auditoria (JSON por linha: usuário, horário, banco, instrução com `PASSWORD = '***'`, resultado/linhas/erro). Fica fora de `/output`, então não é servida pela web |
 | `JAVA_OPTS` | `-Xmx1g` | Memória do SchemaSpy (aumente para bancos com milhares de tabelas) |

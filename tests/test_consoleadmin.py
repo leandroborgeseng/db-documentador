@@ -49,7 +49,8 @@ class Mask(unittest.TestCase):
 
 
 class Auth(unittest.TestCase):
-    CFG = {"admin_enabled": True, "admin_user": "admin", "admin_pass": FAKE}
+    CFG = {"admin_enabled": True, "admin_user": "admin", "admin_pass": FAKE,
+           "admin_sql_user": "dbdoc_admin_test", "admin_sql_pass": "Fake-Sql-1"}
 
     def test_ok(self): self.assertTrue(check_admin(self.CFG, "admin", FAKE))
     def test_bad(self):
@@ -178,7 +179,9 @@ class Routes(unittest.TestCase):
 
     def admin(self, **extra):
         return load_run(CONSOLE_ADMIN_ENABLED="true", CONSOLE_ADMIN_USER="admin",
-                        CONSOLE_ADMIN_PASSWORD="Fake-Admin-1", CONSOLE_ADMIN_AUDIT_LOG=self.audit, **extra)
+                        CONSOLE_ADMIN_PASSWORD="Fake-Admin-1", CONSOLE_ADMIN_AUDIT_LOG=self.audit,
+                        **{"CONSOLE_ADMIN_SQL_USER": "dbdoc_admin_test", "CONSOLE_ADMIN_SQL_PASSWORD": "Fake-Sql-1",
+                           **extra})
 
     def body(self, **kw):
         b = {"database": "dbdoc_test", "query": f"CREATE LOGIN x_ro WITH PASSWORD = '{FAKE}'",
@@ -211,11 +214,11 @@ class Routes(unittest.TestCase):
         self.assertFalse(FakeConn.log[0].kw["autocommit"])
         self.assertIn("BEGIN TRANSACTION", FakeConn.log[0].executed)
 
-    def test_enabled_without_credential_denies(self):
-        run = load_run(CONSOLE_ADMIN_ENABLED="true", CONSOLE_ADMIN_AUDIT_LOG=self.audit)
-        code, out = call(run, "POST", "/api/sql/admin/preview", self.body(admin_password=""))
-        self.assertEqual(code, 403)
-        self.assertIn("somente leitura", out["error"])
+    def test_enabled_without_credential_stays_off(self):
+        run = load_run(CONSOLE_ADMIN_ENABLED="true", CONSOLE_ADMIN_AUDIT_LOG=self.audit,
+                       CONSOLE_ADMIN_SQL_USER="dbdoc_admin_test", CONSOLE_ADMIN_SQL_PASSWORD="Fake-Sql-1")
+        self.assertEqual(call(run, "POST", "/api/sql/admin/preview", self.body(admin_password=""))[0], 404)
+        self.assertIn("const ADMIN=false", call(run, "GET", "/sql")[1])
 
     def test_basic_auth_required(self):
         run = self.admin()
@@ -250,6 +253,8 @@ class Routes(unittest.TestCase):
         self.assertEqual(len(FakeConn.log), 1)
         self.assertTrue(FakeConn.log[0].kw["autocommit"])
         self.assertEqual(FakeConn.log[0].kw["database"], "dbdoc_test")
+        self.assertEqual(FakeConn.log[0].kw["user"], "dbdoc_admin_test")  # nunca MSSQL_USER
+        self.assertNotEqual(FakeConn.log[0].kw["user"], run.CFG["user"])
         # token não reaproveita
         self.assertEqual(call(run, "POST", "/api/sql/admin/confirm", self.body(token=pv["token"], confirm=True))[0], 403)
         text = self.audit_text()
@@ -373,3 +378,49 @@ class AdminScopeRoutes(Routes):
             self.assertEqual(code, 200, (q, out))
         self.assertEqual(len(FakeConn.log), 3)
         self.assertTrue(all(c.kw["database"] == "dbdoc_test" for c in FakeConn.log))
+
+
+from consoleadmin import forbidden_sql_user, admin_problem  # noqa: E402
+
+
+class AdminSqlLogin(Routes):
+    def test_forbidden_names(self):
+        for n in ("sistema", "SISTEMA", "Sistema", " sistema ", "[sistema]", "PMF\\sistema", "pmf\\SISTEMA",
+                  "sistema@pmf.local", "SISTEMA@PMF"):
+            self.assertTrue(forbidden_sql_user(n), n)
+        for n in ("dbdoc_admin_test", "sistemas", "sistema_ro", "pmf\\leandro", "", None):
+            self.assertFalse(forbidden_sql_user(n), n)
+
+    def test_missing_sql_login_keeps_admin_off(self):
+        for extra in ({"CONSOLE_ADMIN_SQL_USER": ""}, {"CONSOLE_ADMIN_SQL_PASSWORD": ""},
+                      {"CONSOLE_ADMIN_SQL_USER": "", "CONSOLE_ADMIN_SQL_PASSWORD": ""}):
+            run = self.admin(**extra)
+            self.assertIn("ausentes", admin_problem(run.CFG))
+            self.assertEqual(call(run, "POST", "/api/sql/admin/preview", self.body())[0], 404, extra)
+            self.assertIn("const ADMIN=false", call(run, "GET", "/sql")[1])
+        self.assertEqual(FakeConn.log, [])
+
+    def test_sistema_keeps_admin_off(self):
+        for u in ("sistema", "PMF\\Sistema", "sistema@pmf.local"):
+            run = self.admin(CONSOLE_ADMIN_SQL_USER=u)
+            self.assertIn("sistema", admin_problem(run.CFG))
+            self.assertEqual(call(run, "POST", "/api/sql/admin/preview", self.body())[0], 404, u)
+            self.assertEqual(call(run, "POST", "/api/sql/admin/confirm",
+                                  self.body(token="x", confirm=True))[0], 404, u)
+        self.assertEqual(FakeConn.log, [])
+
+    def test_disallowed_refused_before_preview(self):
+        run = self.admin()
+        issued = []
+        orig = run.ADMIN_TOKENS.issue
+        run.ADMIN_TOKENS.issue = lambda *a: issued.append(a) or orig(*a)
+        for q in ("DROP TABLE t", "GRANT CONTROL TO u", "CREATE USER a; DROP TABLE t", "EXEC sp_who",
+                  "CREATE USER a -- x", "DELETE FROM t"):
+            code, out = call(run, "POST", "/api/sql/admin/preview", self.body(query=q))
+            self.assertEqual(code, 403, q)
+            self.assertNotIn("token", out)
+        self.assertEqual(issued, [])
+        text = self.audit_text()
+        self.assertEqual(text.count('"event": "negado"'), 6)
+        self.assertNotIn('"event": "preview"', text)
+        self.assertEqual(FakeConn.log, [])
