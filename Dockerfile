@@ -21,7 +21,8 @@ ENV OUTPUT_DIR=/output \
     PORT=8080 \
     PYTHONUNBUFFERED=1
 
-VOLUME ["/output"]
+RUN mkdir -p /audit
+VOLUME ["/output", "/audit"]
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD curl -fs http://localhost:${PORT:-8080}/health || exit 1

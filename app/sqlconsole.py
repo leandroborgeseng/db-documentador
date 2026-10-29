@@ -8,6 +8,8 @@ import decimal
 import re
 import uuid
 
+from consoleadmin import mask_secrets
+
 class QueryRejected(ValueError):
     pass
 
@@ -183,7 +185,7 @@ def _depth_at(cur, tok):
 
 
 def _label(stmt, limit=60):
-    s = " ".join(t.text for t in stmt[:8])
+    s = mask_secrets(" ".join(t.text for t in stmt[:8]))
     return s if len(s) <= limit else s[:limit - 1] + "…"
 
 
@@ -351,7 +353,7 @@ body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.5 system-ui,sans-
 main{max-width:1300px;margin:0 auto;padding:24px 16px}
 h1{font-size:22px;font-weight:600;margin:0 0 4px} p.m{color:var(--mu);margin:0 0 16px} a{color:var(--run)}
 .bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0}
-select,button,textarea{font:inherit;color:inherit;background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:6px 10px}
+select,button,textarea,input{font:inherit;color:inherit;background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:6px 10px}
 button{cursor:pointer} button.pri{background:var(--run);color:#fff;border-color:var(--run)} button:disabled{opacity:.5;cursor:default}
 textarea{width:100%;box-sizing:border-box;min-height:200px;font:14px/1.4 ui-monospace,Consolas,monospace;resize:vertical}
 #info{color:var(--mu);font-size:13px} #err{color:var(--err);white-space:pre-wrap;margin:8px 0}
@@ -371,6 +373,16 @@ Limite de __MAX__ linhas por resultado e __TIMEOUT__ s.</p>
 <div class="bar"><button class="pri" id="run">Executar (Ctrl+Enter)</button>
 <button id="csv" disabled>Exportar CSV</button><span id="info"></span></div>
 <div id="err" role="alert"></div>
+<section id="adm" hidden style="margin:16px 0;padding:12px;border:2px solid var(--err);border-radius:10px">
+<h2 style="color:var(--err);margin-top:0">Modo administrador (escrita)</h2>
+<p class="m">Executa a instrução do editor <b>com efeito real</b> (sem desfazer). Cada execução pede confirmação e fica na auditoria, com senhas mascaradas.</p>
+<div class="bar"><input id="au" placeholder="Usuário admin" autocomplete="username">
+<input id="ap" type="password" placeholder="Senha admin" autocomplete="current-password">
+<button id="prev">Pré-visualizar escrita</button></div>
+<div id="conf" hidden><p>Banco <b id="cdb"></b>. Confirme a instrução exata (expira em <span id="cexp"></span> s):</p>
+<pre id="cst" style="white-space:pre-wrap;background:var(--card);border:1px solid var(--bd);padding:8px;border-radius:8px"></pre>
+<div class="bar"><button class="pri" id="cok" style="background:var(--err);border-color:var(--err)">Confirmar e executar</button><button id="cno">Cancelar</button></div></div>
+</section>
 <div id="out"></div>
 </main><script>
 const $=id=>document.getElementById(id);let last=null;
@@ -400,6 +412,20 @@ $('csv').onclick=()=>{if(!last||!last.length)return;const lines=[];last.forEach(
  lines.push(x.columns.map(csvCell).join(';'));x.rows.forEach(r=>lines.push(r.map(csvCell).join(';')))});
  const blob=new Blob(['\ufeff'+lines.join('\r\n')],{type:'text/csv;charset=utf-8'});const a=document.createElement('a');
  a.href=URL.createObjectURL(blob);a.download=($('db').value||'consulta')+'_'+new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')+'.csv';a.click();URL.revokeObjectURL(a.href)};
+const ADMIN=__ADMIN__;let pend=null;
+if(ADMIN){$('adm').hidden=false}
+async function adminPost(url,body){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});return r.json()}
+$('prev').onclick=async()=>{$('err').textContent='';$('conf').hidden=true;pend=null;
+ const body={database:$('db').value,query:$('q').value,admin_user:$('au').value,admin_password:$('ap').value};
+ try{const d=await adminPost('/api/sql/admin/preview',body);if(d.error){$('err').textContent=d.error;return}
+  pend={...body,token:d.token};$('cdb').textContent=d.database;$('cexp').textContent=d.expires_in;$('cst').textContent=d.statement;$('conf').hidden=false;
+ }catch(e){$('err').textContent='Erro de comunicação: '+e}};
+$('cno').onclick=()=>{pend=null;$('conf').hidden=true};
+$('cok').onclick=async()=>{if(!pend)return;const body={...pend,confirm:true};pend=null;$('conf').hidden=true;$('info').textContent='Executando escrita…';
+ try{const d=await adminPost('/api/sql/admin/confirm',body);if(d.error){$('err').textContent=d.error;$('info').textContent='';return}
+  const sets=d.result_sets||[];last=sets;render(sets);$('csv').disabled=!sets.length;
+  $('info').textContent='Escrita executada · linhas afetadas: '+(d.rowcount??'—')+' · '+d.elapsed_ms+' ms';
+ }catch(e){$('err').textContent='Erro de comunicação: '+e;$('info').textContent=''}};
 $('run').onclick=run;$('q').addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key==='Enter'){e.preventDefault();run()}});
 </script></body></html>"""
 

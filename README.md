@@ -48,9 +48,20 @@ O SQL Server precisa aceitar login SQL (modo de autenticação misto).
 | `SQL_CONSOLE_USER` / `SQL_CONSOLE_PASSWORD` | (usa `MSSQL_USER`) | Login dedicado do console. **Recomendado:** login só leitura (`db_datareader`) |
 | `SQL_CONSOLE_TIMEOUT` | `30` | Timeout (s) da consulta e `LOCK_TIMEOUT` |
 | `SQL_CONSOLE_MAX_ROWS` | `1000` | Máximo de linhas retornadas (o resto é marcado como truncado) |
+| `CONSOLE_ADMIN_ENABLED` | `false` | Liga o **modo administrador** do console (instruções de escrita: `CREATE LOGIN`, `GRANT`…). Desligado, o console continua só leitura, exatamente como antes |
+| `CONSOLE_ADMIN_USER` / `CONSOLE_ADMIN_PASSWORD` | (sem padrão) | Credencial própria do modo admin, pedida na tela a cada pré-visualização/confirmação, além do Basic auth. Sem ela, o modo admin nega tudo (403) |
+| `CONSOLE_ADMIN_SQL_USER` / `CONSOLE_ADMIN_SQL_PASSWORD` | (usa o login do console) | Login SQL usado nas escritas. Recomendado: um login com só as permissões necessárias |
+| `CONSOLE_ADMIN_TOKEN_TTL` | `120` | Segundos para confirmar a instrução pré-visualizada |
+| `CONSOLE_ADMIN_AUDIT_LOG` | `/audit/console-admin.log` | Auditoria (JSON por linha: usuário, horário, banco, instrução com `PASSWORD = '***'`, resultado/linhas/erro). Fica fora de `/output`, então não é servida pela web |
 | `JAVA_OPTS` | `-Xmx1g` | Memória do SchemaSpy (aumente para bancos com milhares de tabelas) |
 | `JDBC_CONNPROPS` | `encrypt\=false;trustServerCertificate\=true` | Propriedades do driver JDBC |
 | `SITE_TITLE` | `Documentação dos bancos` | Título da página |
+
+## Modo administrador do console
+
+1. Pré-visualizar: a instrução do editor vai para `/api/sql/admin/preview` com o usuário/senha admin; a tela mostra a instrução (senhas mascaradas) e o banco.
+2. Confirmar: o botão **Confirmar e executar** manda um token de uso único, válido por `CONSOLE_ADMIN_TOKEN_TTL` s e preso ao usuário, ao banco e à instrução exata. Qualquer mudança exige nova pré-visualização.
+3. A execução é com efeito real (autocommit). Execuções, erros e negações vão para a auditoria; senhas (`PASSWORD`, `OLD_PASSWORD`, `SECRET`, `IDENTIFIED BY`) nunca aparecem em log, auditoria ou mensagens de erro.
 
 ## Vários servidores SQL Server
 
