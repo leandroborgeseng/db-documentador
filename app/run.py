@@ -901,8 +901,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._send(403, {"error": msg + " O console continua somente leitura."})
         try:
             query = consoleadmin.validate_admin_query(query)
+        except consoleadmin.AdminRejected as e:
+            AUDIT.write("negado", user, database, query, step=step, result="instrução fora da lista: " + str(e))
+            return self._send(403, {"error": safe_msg(str(e))})
+        try:
             database = _db_name(database)
-        except (ValueError, sqlconsole.QueryRejected) as e:
+        except sqlconsole.QueryRejected as e:
             AUDIT.write("negado", user, database, query, step=step, result=str(e))
             return self._send(400, {"error": safe_msg(str(e))})
         if step == "preview":

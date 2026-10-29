@@ -111,10 +111,193 @@ class AuditLog:
         return rec
 
 
+class AdminRejected(ValueError):
+    """Instrução fora da lista permitida do modo administrador (vira 403 + auditoria)."""
+
+
+ALLOWED_DESC = ("Permitido no modo administrador, uma instrução por vez: CREATE LOGIN, CREATE USER, "
+                "ALTER ROLE <papel> ADD MEMBER <usuário> e GRANT SELECT (objeto, schema ou banco).")
+_FORBIDDEN = {"INSERT", "UPDATE", "DELETE", "MERGE", "TRUNCATE", "DROP", "EXEC", "EXECUTE", "DENY",
+              "REVOKE", "USE", "GO", "OPENROWSET", "OPENQUERY", "OPENDATASOURCE", "BULK", "SHUTDOWN",
+              "DBCC", "KILL", "BEGIN", "COMMIT", "ROLLBACK", "INTO", "SELECT", "DECLARE", "SET", "CONTROL",
+              "ALL", "AS", "CASCADE"}
+_LOGIN_OPTS = {"CHECK_POLICY", "CHECK_EXPIRATION", "DEFAULT_DATABASE", "DEFAULT_LANGUAGE", "SID"}
+
+
+class _P:
+    """Leitor sequencial de tokens (de sqlconsole.tokenize) para a gramática restrita."""
+
+    def __init__(self, toks):
+        self.t, self.i = toks, 0
+
+    def peek(self, k=0):
+        j = self.i + k
+        return self.t[j] if j < len(self.t) else None
+
+    def done(self):
+        return self.i >= len(self.t)
+
+    def word(self, *opts):
+        t = self.peek()
+        if t is None or t.kind != "word" or t.text.upper() not in opts:
+            raise AdminRejected(f"Esperado {' ou '.join(opts)}. " + ALLOWED_DESC)
+        self.i += 1
+        return t.text.upper()
+
+    def is_word(self, *opts):
+        t = self.peek()
+        return t is not None and t.kind == "word" and t.text.upper() in opts
+
+    def op(self, ch):
+        t = self.peek()
+        if t is None or t.kind != "op" or t.text != ch:
+            raise AdminRejected(f"Esperado '{ch}'. " + ALLOWED_DESC)
+        self.i += 1
+
+    def is_op(self, ch):
+        t = self.peek()
+        return t is not None and t.kind == "op" and t.text == ch
+
+    def name(self, qualified=False):
+        t = self.peek()
+        if t is None or t.kind not in ("word", "ident"):
+            raise AdminRejected("Nome esperado. " + ALLOWED_DESC)
+        self.i += 1
+        parts = 1
+        while qualified and self.is_op(".") and parts < 3:
+            self.i += 1
+            self.name()
+            parts += 1
+
+    def literal(self):
+        t = self.peek()
+        if t is None or t.kind not in ("str", "num", "word", "ident"):
+            raise AdminRejected("Valor esperado. " + ALLOWED_DESC)
+        self.i += 1
+
+
+def _create_login(p):
+    p.name()
+    if p.is_word("FROM"):
+        p.word("FROM")
+        p.word("WINDOWS")
+        if p.done():
+            return
+        p.word("WITH")
+    else:
+        p.word("WITH")
+        p.word("PASSWORD")
+        p.op("=")
+        if p.peek() is None or p.peek().kind != "str":
+            raise AdminRejected("PASSWORD deve ser um texto entre aspas.")
+        p.i += 1
+        if p.is_word("MUST_CHANGE"):
+            p.i += 1
+        if p.done():
+            return
+        p.op(",")
+    while True:
+        p.word(*_LOGIN_OPTS)
+        p.op("=")
+        p.literal()
+        if p.done():
+            return
+        p.op(",")
+
+
+def _create_user(p):
+    p.name()
+    if p.done():
+        return
+    if p.is_word("WITHOUT"):
+        p.word("WITHOUT")
+        p.word("LOGIN")
+    elif p.is_word("FOR", "FROM"):
+        p.i += 1
+        p.word("LOGIN")
+        p.name()
+    if p.done():
+        return
+    p.word("WITH")
+    p.word("DEFAULT_SCHEMA")
+    p.op("=")
+    p.name()
+
+
+def _grant(p):
+    p.word("SELECT")
+    if p.is_word("ON"):
+        p.i += 1
+        if p.is_word("OBJECT", "SCHEMA", "DATABASE") and p.is_op_at(1, ":"):
+            p.i += 1
+            p.op(":")
+            p.op(":")
+        p.name(qualified=True)
+    p.word("TO")
+    p.name()
+    while p.is_op(","):
+        p.i += 1
+        p.name()
+
+
+def _is_op_at(self, k, ch):
+    t = self.peek(k)
+    return t is not None and t.kind == "op" and t.text == ch
+
+
+_P.is_op_at = _is_op_at
+
+
 def validate_admin_query(sql):
-    """Checagem mínima do modo admin: não vazio e tamanho razoável."""
+    """Valida a instrução do modo admin contra a lista fechada. Devolve o texto limpo; lança AdminRejected."""
+    from sqlconsole import QueryRejected, tokenize  # import tardio: sqlconsole importa este módulo
     if not sql or not sql.strip():
-        raise ValueError("Instrução vazia.")
+        raise AdminRejected("Instrução vazia.")
     if len(sql) > 20_000:
-        raise ValueError("Instrução muito longa para o modo administrador.")
-    return sql.strip()
+        raise AdminRejected("Instrução muito longa para o modo administrador.")
+    try:
+        toks = tokenize(sql)
+    except QueryRejected as e:
+        raise AdminRejected(str(e)) from None
+    # comentários não são aceitos: entre tokens só pode haver espaço em branco
+    prev_end = 0
+    for t in toks:
+        if sql[prev_end:t.start].strip():
+            raise AdminRejected("Comentários não são permitidos no modo administrador.")
+        prev_end = t.end
+    if sql[prev_end:].strip():
+        raise AdminRejected("Comentários não são permitidos no modo administrador.")
+    if toks and toks[-1].kind == "op" and toks[-1].text == ";":
+        toks = toks[:-1]
+    if not toks:
+        raise AdminRejected("Instrução vazia.")
+    grant_select = (len(toks) > 1 and toks[0].kind == "word" and toks[0].text.upper() == "GRANT"
+                    and toks[1].kind == "word" and toks[1].text.upper() == "SELECT")
+    for idx, t in enumerate(toks):
+        u = t.text.upper() if t.kind == "word" else ""
+        if grant_select and idx == 1:
+            continue
+        if t.kind == "op" and t.text == ";":
+            raise AdminRejected("Só uma instrução por execução.")
+        if t.kind in ("var", "temp"):
+            raise AdminRejected("Variáveis e tabelas temporárias não são permitidas no modo administrador.")
+        if u in _FORBIDDEN or u.startswith(("SP_", "XP_")):
+            raise AdminRejected(f"Palavra-chave não permitida no modo administrador ({u}). " + ALLOWED_DESC)
+    p = _P(toks)
+    first = p.word("CREATE", "ALTER", "GRANT")
+    if first == "CREATE":
+        if p.word("LOGIN", "USER") == "LOGIN":
+            _create_login(p)
+        else:
+            _create_user(p)
+    elif first == "ALTER":
+        p.word("ROLE")
+        p.name()
+        p.word("ADD")
+        p.word("MEMBER")
+        p.name()
+    else:
+        _grant(p)
+    if not p.done():
+        raise AdminRejected("Texto a mais depois da instrução. " + ALLOWED_DESC)
+    return sql[toks[0].start:toks[-1].end]

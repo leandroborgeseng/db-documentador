@@ -93,7 +93,8 @@ class Audit(unittest.TestCase):
             a = AuditLog(path, logger=logged.append, secrets_to_hide=[FAKE])
             a.write("executado", "admin", "dbdoc_test", f"CREATE LOGIN x WITH PASSWORD = '{FAKE}'",
                     result="ok", rowcount=-1, error=f"falhou com {FAKE}")
-            raw = open(path, encoding="utf-8").read()
+            with open(path, encoding="utf-8") as f:
+                raw = f.read()
             self.assertNotIn(FAKE, raw)
             self.assertNotIn(FAKE, logged[0])
             rec = json.loads(raw)
@@ -139,6 +140,7 @@ def load_run(**env):
         os.environ.update(old)
     run.console_databases = lambda: ["dbdoc_test"]
     run.log = lambda m: None
+    run.AUDIT.logger = None
     return run
 
 
@@ -185,7 +187,10 @@ class Routes(unittest.TestCase):
         return b
 
     def audit_text(self):
-        return open(self.audit, encoding="utf-8").read() if os.path.exists(self.audit) else ""
+        if not os.path.exists(self.audit):
+            return ""
+        with open(self.audit, encoding="utf-8") as f:
+            return f.read()
 
     def test_flag_off_readonly_unchanged(self):
         run = load_run(CONSOLE_ADMIN_AUDIT_LOG=self.audit)
@@ -273,3 +278,98 @@ class Routes(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+from consoleadmin import validate_admin_query, AdminRejected  # noqa: E402
+
+PW = "'Fake-Pw-123'"
+ALLOWED = [
+    f"CREATE LOGIN sigpmf_educacao_ro WITH PASSWORD = {PW}",
+    f"create login [x_ro] with password={PW}, CHECK_POLICY = ON, CHECK_EXPIRATION = OFF;",
+    f"CREATE LOGIN x WITH PASSWORD = {PW} MUST_CHANGE, CHECK_EXPIRATION = ON",
+    f"CREATE LOGIN x WITH PASSWORD = {PW}, DEFAULT_DATABASE = dbdoc_test",
+    "CREATE LOGIN [DOM\\leandro] FROM WINDOWS",
+    "CREATE USER x_ro FOR LOGIN x_ro",
+    "CREATE USER x_ro FROM LOGIN x_ro WITH DEFAULT_SCHEMA = dbo",
+    "CREATE USER x_ro WITHOUT LOGIN",
+    "CREATE USER x_ro",
+    "ALTER ROLE db_datareader ADD MEMBER x_ro",
+    "  alter   role [db_datareader]\n add\tmember [x_ro] ; ",
+    "GRANT SELECT ON dbo.Aluno TO x_ro",
+    "GRANT SELECT ON OBJECT::dbo.Aluno TO x_ro",
+    "GRANT SELECT ON SCHEMA::dbo TO x_ro, y_ro",
+    "GRANT SELECT ON DATABASE::dbdoc_test TO x_ro",
+    "GRANT SELECT TO x_ro",
+    "GRANT SELECT ON [dbo].[Aluno] TO [x_ro]",
+]
+BLOCKED = [
+    "INSERT INTO t VALUES (1)", "UPDATE t SET a = 1", "DELETE FROM t", "MERGE t USING s ON 1=1",
+    "TRUNCATE TABLE t", "DROP LOGIN x", "DROP TABLE t", "DROP USER x",
+    "EXEC sp_addrolemember 'db_owner', 'x'", "EXECUTE ('DROP TABLE t')", "sp_addlogin 'x'",
+    "EXEC xp_cmdshell 'dir'", "ALTER LOGIN sa ENABLE", "ALTER LOGIN x WITH PASSWORD = 'a'",
+    "ALTER TABLE t ADD c int", "ALTER ROLE db_owner DROP MEMBER x", "ALTER ROLE r WITH NAME = s",
+    "ALTER SERVER ROLE sysadmin ADD MEMBER x", "ALTER DATABASE x SET SINGLE_USER",
+    "GRANT CONTROL ON DATABASE::x TO u", "GRANT ALL TO u", "GRANT INSERT ON t TO u",
+    "GRANT SELECT, INSERT ON t TO u", "GRANT SELECT ON t TO u WITH GRANT OPTION",
+    "GRANT SELECT ON t TO u AS dbo", "GRANT EXECUTE TO u", "GRANT ALTER ANY LOGIN TO u",
+    "GRANT IMPERSONATE ON LOGIN::sa TO u", "DENY SELECT ON t TO u", "REVOKE SELECT ON t FROM u",
+    "CREATE LOGIN a WITH PASSWORD = 'x'; DROP TABLE t", "CREATE USER a; CREATE USER b",
+    "CREATE USER a\nGO\nCREATE USER b", "CREATE USER a GO",
+    "CREATE USER a -- comentário", "/* x */ CREATE USER a", "CREATE /* ; DROP TABLE t */ USER a",
+    "CREATE USER a /* sem fim", "USE master; CREATE USER a", "USE master",
+    "CREATE LOGIN a WITH PASSWORD = 'x', CHECK_POLICY = OFF; EXEC('DROP TABLE t')",
+    "DECLARE @s nvarchar(100) = 'DROP TABLE t'", "CREATE TABLE t (a int)", "CREATE PROCEDURE p AS SELECT 1",
+    "CREATE LOGIN a WITH PASSWORD = @p", "CREATE LOGIN a WITH PASSWORD = 'x' SELECT 1",
+    "CREATE USER a FOR LOGIN b WITH DEFAULT_SCHEMA = dbo, PASSWORD = 'x'",
+    "SELECT * FROM t", "CREATE LOGIN a WITH PASSWORD = 'x', SID = 0x01, CREDENTIAL = c",
+    "GRANT SELECT ON t TO u; GRANT CONTROL TO u", "CREATE LOGIN a FROM CERTIFICATE c",
+    "SHUTDOWN", "", "   ;  ", "CREATE USER a; ;",
+]
+
+
+class AdminScope(unittest.TestCase):
+    def test_allowed(self):
+        for q in ALLOWED:
+            with self.subTest(q=q):
+                self.assertTrue(validate_admin_query(q))
+
+    def test_blocked(self):
+        for q in BLOCKED:
+            with self.subTest(q=q):
+                with self.assertRaises(AdminRejected):
+                    validate_admin_query(q)
+
+    def test_strips_trailing_semicolon(self):
+        self.assertEqual(validate_admin_query("CREATE USER a ;"), "CREATE USER a")
+
+
+class AdminScopeRoutes(Routes):
+    def test_blocked_is_403_and_audited(self):
+        run = self.admin()
+        for q in ("DROP TABLE t", "GRANT CONTROL TO u", "CREATE USER a; DROP TABLE t", "EXEC sp_who"):
+            code, out = call(run, "POST", "/api/sql/admin/preview", self.body(query=q))
+            self.assertEqual(code, 403, q)
+            code, _ = call(run, "POST", "/api/sql/admin/confirm", self.body(query=q, token="x", confirm=True))
+            self.assertEqual(code, 403, q)
+        self.assertEqual(FakeConn.log, [])
+        text = self.audit_text()
+        self.assertEqual(text.count('"event": "negado"'), 8)
+        self.assertIn("instrução fora da lista", text)
+
+    def test_blocked_with_password_is_masked(self):
+        run = self.admin()
+        q = f"ALTER LOGIN sa WITH PASSWORD = '{FAKE}'"
+        code, out = call(run, "POST", "/api/sql/admin/preview", self.body(query=q))
+        self.assertEqual(code, 403)
+        self.assertNotIn(FAKE, out["error"])
+        self.assertNotIn(FAKE, self.audit_text())
+
+    def test_allowed_types_execute(self):
+        run = self.admin()
+        for q in ("CREATE USER x_ro FOR LOGIN x_ro", "ALTER ROLE db_datareader ADD MEMBER x_ro",
+                  "GRANT SELECT ON SCHEMA::dbo TO x_ro"):
+            _, pv = call(run, "POST", "/api/sql/admin/preview", self.body(query=q))
+            code, out = call(run, "POST", "/api/sql/admin/confirm", self.body(query=q, token=pv["token"], confirm=True))
+            self.assertEqual(code, 200, (q, out))
+        self.assertEqual(len(FakeConn.log), 3)
+        self.assertTrue(all(c.kw["database"] == "dbdoc_test" for c in FakeConn.log))
