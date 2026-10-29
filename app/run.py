@@ -16,6 +16,7 @@ Lê só uma amostra de SAMPLE_ROWS linhas por tabela (amostras.md, com colunas s
 import base64
 import datetime as dt
 import functools
+import hmac
 import html
 import http.server
 import json
@@ -30,6 +31,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pymssql
 
 import bundle
+import consoleadmin
 import sqlconsole
 
 
@@ -68,6 +70,14 @@ CFG = {
     "sql_pass": env("SQL_CONSOLE_PASSWORD", "") if env("SQL_CONSOLE_USER", "") else env("MSSQL_PASSWORD", ""),
     "sql_timeout": int(env("SQL_CONSOLE_TIMEOUT", "30")),
     "sql_max_rows": int(env("SQL_CONSOLE_MAX_ROWS", "1000")),
+    # Modo administrador do console (escrita). Desligado por padrão; sem credencial padrão.
+    "admin_enabled": env("CONSOLE_ADMIN_ENABLED", "false").lower() == "true",
+    "admin_user": env("CONSOLE_ADMIN_USER", ""),
+    "admin_pass": env("CONSOLE_ADMIN_PASSWORD", ""),
+    "admin_sql_user": env("CONSOLE_ADMIN_SQL_USER", ""),
+    "admin_sql_pass": env("CONSOLE_ADMIN_SQL_PASSWORD", ""),
+    "admin_token_ttl": int(env("CONSOLE_ADMIN_TOKEN_TTL", "120")),
+    "admin_audit_log": env("CONSOLE_ADMIN_AUDIT_LOG", "/audit/console-admin.log"),
 }
 
 SYSTEM_DBS = {"master", "model", "msdb", "tempdb", "distribution", "ssisdb", "reportserver", "reportservertempdb"}
@@ -78,6 +88,17 @@ STATUS = {"started": None, "finished": None, "running": False, "databases": {}}
 
 def log(msg):
     print(f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
+
+
+_HIDDEN = tuple(v for v in (CFG["password"], CFG["sql_pass"], CFG["auth_pass"], CFG["admin_pass"],
+                            CFG["admin_sql_pass"]) if v)
+ADMIN_TOKENS = consoleadmin.TokenStore(ttl=CFG["admin_token_ttl"])
+AUDIT = consoleadmin.AuditLog(CFG["admin_audit_log"], logger=log, secrets_to_hide=_HIDDEN)
+
+
+def safe_msg(msg):
+    """Mascara PASSWORD/SECRET/IDENTIFIED BY e as senhas configuradas antes de mostrar ou logar."""
+    return consoleadmin.mask_secrets(msg, _HIDDEN)
 
 
 def connect(database="master"):
@@ -693,9 +714,46 @@ def run_console_query(database, query):
     ms = int((time.monotonic() - t0) * 1000)
     nrows = sum(len(x["rows"]) for x in result["result_sets"])
     log(f"[sql] db={database} sets={len(result['result_sets'])} rows={nrows}{'+' if result['truncated'] else ''} "
-        f"ms={ms} q={' '.join(query.split())[:200]!r}")
+        f"ms={ms} q={safe_msg(' '.join(query.split()))[:200]!r}")
     result["elapsed_ms"] = ms
     return result
+
+
+def _db_name(database):
+    dbs = {d.lower(): d for d in console_databases()}
+    if not database or database.lower() not in dbs:
+        raise sqlconsole.QueryRejected("Banco inválido.")
+    return dbs[database.lower()]
+
+
+def run_admin_statement(database, query):
+    """Executa uma instrução de escrita já confirmada (autocommit) com o login do modo admin."""
+    t0 = time.monotonic()
+    conn = pymssql.connect(
+        server=CFG["host"], port=CFG["port"],
+        user=CFG["admin_sql_user"], password=CFG["admin_sql_pass"],  # sem fallback para MSSQL_USER
+        database=database, login_timeout=15, timeout=CFG["sql_timeout"], charset="UTF-8",
+        autocommit=True,
+    )
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SET LOCK_TIMEOUT {CFG['sql_timeout'] * 1000}")
+        cur.execute(query)
+        rowcount = cur.rowcount
+        result = sqlconsole.collect_result_sets(cur, CFG["sql_max_rows"])
+    finally:
+        conn.close()
+    result["rowcount"] = rowcount
+    result["elapsed_ms"] = int((time.monotonic() - t0) * 1000)
+    return result
+
+
+def _err_text(e):
+    args = getattr(e, "args", ())
+    msg = args[1] if len(args) > 1 and isinstance(args[1], (bytes, str)) else str(e)
+    if isinstance(msg, bytes):
+        msg = msg.decode("utf-8", "replace")
+    return safe_msg(msg)
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
@@ -708,7 +766,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return True
         expected = "Basic " + base64.b64encode(
             f"{CFG['auth_user']}:{CFG['auth_pass']}".encode()).decode()
-        if self.headers.get("Authorization") == expected:
+        if hmac.compare_digest(self.headers.get("Authorization", "").encode(), expected.encode()):
             return True
         self.send_response(401)
         self.send_header("WWW-Authenticate", 'Basic realm="docs"')
@@ -757,7 +815,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             if path == "/api/sql":
                 return self._send(405, {"error": "Use POST."})
             page = (sqlconsole.PAGE.replace("__MAX__", str(CFG["sql_max_rows"]))
-                    .replace("__TIMEOUT__", str(CFG["sql_timeout"])))
+                    .replace("__TIMEOUT__", str(CFG["sql_timeout"]))
+                    .replace("__ADMIN__", "true" if consoleadmin.admin_active(CFG) else "false"))
             return self._send(200, page, "text/html; charset=utf-8")
         if not self._authorized():
             return
@@ -791,6 +850,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 return
             threading.Thread(target=refresh_sizes, daemon=True).start()
             return self._send(202, {"ok": True, "message": "Atualizando tamanhos; recarregue em alguns segundos."})
+        if path in ("/api/sql/admin/preview", "/api/sql/admin/confirm"):
+            if not self._console_gate():
+                return
+            return self._admin(path)
         if path != "/api/sql":
             return self._send(404, {"error": "Não encontrado."})
         if not self._console_gate():
@@ -803,17 +866,64 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             result = run_console_query(str(data.get("database") or ""), str(data.get("query") or ""))
             self._send(200, result)
         except sqlconsole.QueryRejected as e:
-            log(f"[sql] recusada: {e}")
-            self._send(400, {"error": str(e)})
+            msg = safe_msg(str(e))
+            log(f"[sql] recusada: {msg}")
+            hint = (" Instruções de escrita só no modo administrador (CONSOLE_ADMIN_ENABLED)."
+                    if consoleadmin.admin_active(CFG) else "")
+            self._send(400, {"error": msg + hint})
         except (ValueError, json.JSONDecodeError):
             self._send(400, {"error": "JSON inválido."})
         except Exception as e:
-            args = getattr(e, "args", ())
-            msg = args[1] if len(args) > 1 and isinstance(args[1], (bytes, str)) else str(e)
-            if isinstance(msg, bytes):
-                msg = msg.decode("utf-8", "replace")
+            msg = _err_text(e)
             log(f"[sql] erro: {msg[:300]}")
             self._send(400, {"error": msg[:2000]})
+
+    def _admin(self, path):
+        """POST /api/sql/admin/preview e /api/sql/admin/confirm. Já passou pelo _console_gate."""
+        if not consoleadmin.admin_active(CFG):
+            return self._send(404, {"error": "Modo administrador desligado."})
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            if n > 200_000:
+                return self._send(413, {"error": "Instrução muito grande."})
+            data = json.loads(self.rfile.read(n) or b"{}")
+        except (ValueError, json.JSONDecodeError):
+            return self._send(400, {"error": "JSON inválido."})
+        user = str(data.get("admin_user") or "")
+        query = str(data.get("query") or "")
+        database = str(data.get("database") or "")
+        step = "preview" if path.endswith("/preview") else "confirm"
+        if not consoleadmin.check_admin(CFG, user, data.get("admin_password")):
+            AUDIT.write("negado", user, database, query, step=step, result="credencial inválida")
+            return self._send(403, {"error": "Credencial de administrador inválida. O console continua somente leitura."})
+        try:
+            query = consoleadmin.validate_admin_query(query)
+        except consoleadmin.AdminRejected as e:
+            AUDIT.write("negado", user, database, query, step=step, result="instrução fora da lista: " + str(e))
+            return self._send(403, {"error": safe_msg(str(e))})
+        try:
+            database = _db_name(database)
+        except sqlconsole.QueryRejected as e:
+            AUDIT.write("negado", user, database, query, step=step, result=str(e))
+            return self._send(400, {"error": safe_msg(str(e))})
+        if step == "preview":
+            token = ADMIN_TOKENS.issue(user, database, query)
+            AUDIT.write("preview", user, database, query, result="aguardando confirmação")
+            return self._send(200, {"token": token, "database": database, "expires_in": CFG["admin_token_ttl"],
+                                    "statement": safe_msg(query)})
+        if data.get("confirm") is not True or not ADMIN_TOKENS.consume(data.get("token"), user, database, query):
+            AUDIT.write("negado", user, database, query, step=step,
+                        result="confirmação ausente, expirada ou de outra instrução")
+            return self._send(403, {"error": "Confirmação inválida ou expirada. Pré-visualize de novo."})
+        try:
+            result = run_admin_statement(database, query)
+        except Exception as e:
+            msg = _err_text(e)
+            AUDIT.write("erro", user, database, query, result="erro", error=msg[:500])
+            return self._send(400, {"error": msg[:2000]})
+        AUDIT.write("executado", user, database, query, result="ok", rowcount=result.get("rowcount"),
+                    elapsed_ms=result.get("elapsed_ms"))
+        return self._send(200, result)
 
     def log_message(self, *args):
         pass
@@ -849,6 +959,9 @@ def load_previous():
 
 def main():
     os.makedirs(CFG["output"], exist_ok=True)
+    if CFG["admin_enabled"]:
+        problem = consoleadmin.admin_problem(CFG)
+        log("Console: modo administrador " + ("LIGADO" if not problem else f"DESLIGADO ({problem})"))
     age = load_previous()
     write_index()
     threading.Thread(target=serve, daemon=True).start()
