@@ -980,8 +980,27 @@ def load_previous():
     return (time.time() - ts) if ts else None
 
 
+def startup_audit():
+    """Com CONSOLE_ADMIN_ALLOW_SISTEMA ligada, grava uma linha 'inicio' na auditoria (ATE, início com fuso,
+    estado do modo admin). Flag desligada: não grava nada. Nunca inclui senha."""
+    if not CFG["admin_allow_sistema"]:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        started = dt.datetime.now(ZoneInfo(consoleadmin.SP_TZ))
+    except Exception:  # sem tzdata: UTC-3 fixo
+        started = dt.datetime.now(dt.timezone(dt.timedelta(hours=-3)))
+    problem = consoleadmin.admin_problem(CFG) if CFG["admin_enabled"] else "CONSOLE_ADMIN_ENABLED desligado"
+    extra = {"via_sistema": True, "ate": CFG["admin_allow_sistema_ate"],
+             "inicio": started.isoformat(timespec="seconds"), "modo_admin": "desligado" if problem else "ligado"}
+    if problem:
+        extra["motivo"] = problem
+    return AUDIT.write("inicio", "", **extra)
+
+
 def main():
     os.makedirs(CFG["output"], exist_ok=True)
+    startup_audit()
     if CFG["admin_enabled"]:
         problem = consoleadmin.admin_problem(CFG)
         log("Console: modo administrador " + ("LIGADO" if not problem else f"DESLIGADO ({problem})"))

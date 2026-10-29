@@ -200,6 +200,46 @@ class AllowSistema(tca.Routes):
             self.assertNotIn(SIS_PW, text)
         self.assertNotIn("Fake-Admin-1", self.audit_text())
 
+    def _inicio_lines(self):
+        import json
+        return [json.loads(x) for x in self.audit_text().splitlines() if '"event": "inicio"' in x]
+
+    def test_startup_audit_on_valid(self):
+        run = self.ok()
+        run.startup_audit()
+        (rec,) = self._inicio_lines()
+        self.assertTrue(rec["via_sistema"])
+        self.assertEqual(rec["ate"], d(3))
+        self.assertEqual(rec["modo_admin"], "ligado")
+        self.assertNotIn("motivo", rec)
+        self.assertRegex(rec["inicio"], r"T\d\d:\d\d:\d\d-03:00$")
+        self.assertNotIn(SIS_PW, self.audit_text())
+
+    def test_startup_audit_on_expired_or_invalid(self):
+        for ate, why in ((d(-1), "venc"), ("31/12/2026", "inválida"), (d(30), "")):
+            if os.path.exists(self.audit):
+                os.remove(self.audit)
+            run = self.sis(CONSOLE_ADMIN_ALLOW_SISTEMA="true", CONSOLE_ADMIN_ALLOW_SISTEMA_ATE=ate)
+            run.startup_audit()
+            (rec,) = self._inicio_lines()
+            self.assertTrue(rec["via_sistema"])
+            self.assertEqual(rec["ate"], ate)
+            self.assertEqual(rec["modo_admin"], "desligado")
+            self.assertIn(why, rec["motivo"])
+            self.assertNotIn(SIS_PW, self.audit_text())
+
+    def test_startup_audit_flag_off_writes_nothing(self):
+        run = self.sis(CONSOLE_ADMIN_ALLOW_SISTEMA="false", CONSOLE_ADMIN_ALLOW_SISTEMA_ATE=d(3))
+        self.assertIsNone(run.startup_audit())
+        self.assertEqual(self.audit_text(), "")
+
+    def test_mask_short_passwords_by_value(self):
+        for pw in ("x", "q9", "z7k"):
+            out = consoleadmin.mask_secrets(f"falha login com {pw} fim", (pw,))
+            self.assertNotIn(pw, out.replace("***", ""))
+        rec = consoleadmin.AuditLog("", secrets_to_hide=("k3y",)).write("erro", "u", error="erro k3y")
+        self.assertEqual(rec["error"], "erro ***")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -37,9 +37,8 @@ def mask_secrets(text, extra=()):
         hashed = " HASHED" if re.search(r"HASHED$", m.group("val"), re.I) else ""
         return f"{m.group('kw')}{m.group('sep')}'***'{hashed}"
     text = _SECRET_RE.sub(repl, str(text))
-    for s in extra:
-        if s and len(s) >= 4:
-            text = text.replace(s, "***")
+    for s in sorted((x for x in extra if x), key=len, reverse=True):  # qualquer tamanho, mais longo primeiro
+        text = text.replace(s, "***")
     return text
 
 
