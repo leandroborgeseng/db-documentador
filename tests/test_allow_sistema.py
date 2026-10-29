@@ -155,7 +155,7 @@ class AllowSistema(tca.Routes):
               "ALTER LOGIN x ENABLE", "GRANT ALTER ANY LOGIN TO x", "GRANT ALTER ANY USER TO x",
               "GRANT ALTER ANY ROLE TO x", "ALTER ROLE db_owner ADD MEMBER x", "GRANT SELECT ON t TO public",
               "CREATE USER x WITHOUT LOGIN", "CREATE LOGIN x FROM WINDOWS", "CREATE LOGIN x WITH PASSWORD='a', SID = 0x01",
-              "CREATE USER a; DROP TABLE t", "CREATE USER a\nGO", "CREATE USER a -- x", "CREATE USER a /* x */",
+              "CREATE USER a; DROP TABLE t", "CREATE USER a -- x", "CREATE USER a /* x */",
               "DROP TABLE t", "GRANT SELECT ON t TO x WITH GRANT OPTION")
         for q in qs:
             code, out = call(run, "POST", "/api/sql/admin/preview", self.body(query=q))

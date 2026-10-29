@@ -376,12 +376,12 @@ Limite de __MAX__ linhas por resultado e __TIMEOUT__ s.</p>
 <section id="adm" hidden style="margin:16px 0;padding:12px;border:2px solid var(--err);border-radius:10px">
 <h2 style="color:var(--err);margin-top:0">Modo administrador (escrita)</h2>
 __SISTEMA__
-<p class="m">Executa a instrução do editor <b>com efeito real</b> (sem desfazer). Cada execução pede confirmação e fica na auditoria, com senhas mascaradas.</p>
+<p class="m">Executa o script do editor <b>com efeito real</b> (sem desfazer). Aceita o script inteiro: comandos separados por <code>;</code> ou <code>GO</code>, e <code>USE [banco]</code> troca o banco dos comandos seguintes. Uma confirmação para a lista toda; cada comando fica numa linha da auditoria, com senhas mascaradas.</p>
 <div class="bar"><input id="au" placeholder="Usuário admin" autocomplete="username">
 <input id="ap" type="password" placeholder="Senha admin" autocomplete="current-password">
 <button id="prev">Pré-visualizar escrita</button></div>
-<div id="conf" hidden><p>Banco <b id="cdb"></b>. Confirme a instrução exata (expira em <span id="cexp"></span> s):</p>
-<pre id="cst" style="white-space:pre-wrap;background:var(--card);border:1px solid var(--bd);padding:8px;border-radius:8px"></pre>
+<div id="conf" hidden><p id="chd">Confirme os comandos exatos (expira em <span id="cexp"></span> s):</p>
+<ol id="cst" style="background:var(--card);border:1px solid var(--bd);padding:8px 8px 8px 32px;border-radius:8px;font:13px ui-monospace,Consolas,monospace"></ol>
 <div class="bar"><button class="pri" id="cok" style="background:var(--err);border-color:var(--err)">Confirmar e executar</button><button id="cno">Cancelar</button></div></div>
 </section>
 <div id="out"></div>
@@ -395,7 +395,8 @@ fetch('/api/databases').then(r=>r.json()).then(d=>{const s=$('db');s.innerHTML='
 async function run(){const b=$('run');if(b.disabled)return;b.disabled=true;$('err').textContent='';$('info').textContent='Executando…';
  localStorage.setItem('sqlconsole',JSON.stringify({db:$('db').value,q:$('q').value}));
  try{const r=await fetch('/api/sql',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({database:$('db').value,query:$('q').value})});
-  const d=await r.json(); if(d.error){$('err').textContent=d.error;$('info').textContent='';return}
+  const d=await r.json(); if(d.error){$('err').textContent=d.error;$('info').textContent='';
+   if(d.use_admin&&ADMIN){const p=$('prev');p.scrollIntoView({behavior:'smooth',block:'center'});p.focus()}return}
   const sets=d.result_sets||[{columns:d.columns,rows:d.rows,truncated:d.truncated}];
   last=sets;render(sets);$('csv').disabled=!sets.length;
   const n=sets.reduce((a,x)=>a+x.rows.length,0);
@@ -416,16 +417,26 @@ $('csv').onclick=()=>{if(!last||!last.length)return;const lines=[];last.forEach(
 const ADMIN=__ADMIN__;let pend=null;
 if(ADMIN){$('adm').hidden=false}
 async function adminPost(url,body){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});return r.json()}
+function cmdList(items,res){const ol=$('cst');ol.innerHTML='';(items||[]).forEach(c=>{const li=document.createElement('li');
+ const st=res?(c.status==='ok'?'✓ ':c.status==='erro'?'✗ ':'— '):'';
+ li.textContent=st+'['+(c.database||'?')+'] '+c.statement+(c.error?'  ⟶ '+c.error:'')+(c.status==='não executado'?'  (não executado)':'');
+ li.style.whiteSpace='pre-wrap';if(!c.ok||c.status==='erro'){li.style.color='var(--err)'}ol.appendChild(li)})}
 $('prev').onclick=async()=>{$('err').textContent='';$('conf').hidden=true;pend=null;
  const body={database:$('db').value,query:$('q').value,admin_user:$('au').value,admin_password:$('ap').value};
- try{const d=await adminPost('/api/sql/admin/preview',body);if(d.error){$('err').textContent=d.error;return}
-  pend={...body,token:d.token};$('cdb').textContent=d.database;$('cexp').textContent=d.expires_in;$('cst').textContent=d.statement;$('conf').hidden=false;
+ try{const d=await adminPost('/api/sql/admin/preview',body);
+  if(d.commands){cmdList(d.commands,false);$('conf').hidden=false;$('chd').textContent=d.can_confirm?
+   d.commands.length+' comando(s). Confirme a lista exata (expira em '+d.expires_in+' s):':'Há comando recusado (em vermelho). Corrija o script e pré-visualize de novo.';
+   $('cok').disabled=!d.can_confirm}
+  if(d.error){$('err').textContent=d.error;return}
+  pend={...body,token:d.token};
  }catch(e){$('err').textContent='Erro de comunicação: '+e}};
 $('cno').onclick=()=>{pend=null;$('conf').hidden=true};
-$('cok').onclick=async()=>{if(!pend)return;const body={...pend,confirm:true};pend=null;$('conf').hidden=true;$('info').textContent='Executando escrita…';
- try{const d=await adminPost('/api/sql/admin/confirm',body);if(d.error){$('err').textContent=d.error;$('info').textContent='';return}
+$('cok').onclick=async()=>{if(!pend||$('cok').disabled)return;const body={...pend,confirm:true};pend=null;$('cok').disabled=true;$('info').textContent='Executando escrita…';
+ try{const d=await adminPost('/api/sql/admin/confirm',body);
+  if(d.results){cmdList(d.results,true);$('chd').textContent='Resultado por comando:'}
+  if(d.error){$('err').textContent=d.error;$('info').textContent='';return}
   const sets=d.result_sets||[];last=sets;render(sets);$('csv').disabled=!sets.length;
-  $('info').textContent='Escrita executada · linhas afetadas: '+(d.rowcount??'—')+' · '+d.elapsed_ms+' ms';
+  $('info').textContent='Escrita executada · '+(d.results||[]).length+' comando(s) · '+d.elapsed_ms+' ms';
  }catch(e){$('err').textContent='Erro de comunicação: '+e;$('info').textContent=''}};
 $('run').onclick=run;$('q').addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key==='Enter'){e.preventDefault();run()}});
 </script></body></html>"""

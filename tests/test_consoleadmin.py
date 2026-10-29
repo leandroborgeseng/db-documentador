@@ -341,7 +341,7 @@ BLOCKED = [
     "GRANT SELECT ON t TO u; GRANT CONTROL TO u", "CREATE LOGIN a FROM CERTIFICATE c",
     "SHUTDOWN", "", "   ;  ", "CREATE USER a; ;",
     "CREATE LOGIN [DOM\\leandro] FROM WINDOWS", "create login x from windows with default_database = d",
-    "CREATE LOGIN a WITH PASSWORD = 'x', SID = 0x01", "CREATE USER a;", "CREATE USER a ; ",
+    "CREATE LOGIN a WITH PASSWORD = 'x', SID = 0x01", "CREATE USER a ; ",
     "DROP DATABASE x", "EXEC sp_addsrvrolemember 'a','sysadmin'", "GRANT CONTROL SERVER TO x",
     "CREATE LOGIN a WITH PASSWORD='x'; DROP TABLE t", "CREATE LOGIN a WITH PASSWORD = 0x0200ABCDEF HASHED",
     "GRANT SELECT ON t TO u\nGO", "GRANT SELECT ON t TO u /**/", "CREATE LOGIN a WITH PASSWORD = 'x', sid=0x1234",
@@ -450,7 +450,7 @@ class AdminSqlLogin(Routes):
         orig = run.ADMIN_TOKENS.issue
         run.ADMIN_TOKENS.issue = lambda *a: issued.append(a) or orig(*a)
         for q in ("DROP TABLE t", "GRANT CONTROL TO u", "CREATE USER a; DROP TABLE t", "EXEC sp_who",
-                  "CREATE USER a -- x", "DELETE FROM t", "CREATE USER a;", "CREATE USER a\nGO",
+                  "CREATE USER a -- x", "DELETE FROM t",
                   "DROP DATABASE x", "TRUNCATE TABLE t", "EXEC sp_addsrvrolemember 'a','sysadmin'",
                   "GRANT CONTROL SERVER TO x", "CREATE LOGIN a WITH PASSWORD='x'; DROP TABLE t",
                   "ALTER ROLE db_owner ADD MEMBER x", "GRANT SELECT ON t TO x, public", "CREATE USER x WITHOUT LOGIN"):
@@ -459,7 +459,7 @@ class AdminSqlLogin(Routes):
             self.assertNotIn("token", out)
         self.assertEqual(issued, [])
         text = self.audit_text()
-        self.assertEqual(text.count('"event": "negado"'), 16)
+        self.assertEqual(text.count('"event": "negado"'), 15)  # 14 scripts; um deles tem 2 comandos recusados (1 linha de auditoria por comando)
         self.assertNotIn('"event": "preview"', text)
         self.assertEqual(FakeConn.log, [])
 
