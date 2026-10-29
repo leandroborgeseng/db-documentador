@@ -964,6 +964,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                         result="confirmação ausente, expirada ou de outra instrução")
             return self._send(403, {"error": "Confirmação inválida ou expirada. Pré-visualize de novo."})
         results, failed = [], None
+        batch_secrets = [x for c in cmds for x in consoleadmin.extract_secrets(c["statement"])]
         for c, v in zip(cmds, view):
             if failed is not None:
                 results.append({**v, "status": "não executado"})
@@ -971,7 +972,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             try:
                 r = run_admin_statement(c["database"], c["statement"])
             except Exception as e:
-                msg = _err_text(e)
+                msg = consoleadmin.mask_secrets(_err_text(e), batch_secrets)  # servidor pode ecoar a senha
                 AUDIT.write("erro", user, c["database"], c["statement"], **_audit_extra(), command=v["n"],
                             total=len(cmds), result="erro", error=msg[:500])
                 failed = v["n"]

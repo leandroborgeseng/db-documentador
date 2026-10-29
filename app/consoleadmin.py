@@ -42,6 +42,22 @@ def mask_secrets(text, extra=()):
     return text
 
 
+def extract_secrets(text):
+    """Valores literais depois de PASSWORD/SECRET/IDENTIFIED BY no texto (para apagar ecos em erros do servidor)."""
+    out = []
+    for m in _SECRET_RE.finditer(str(text or "")):
+        v = m.group("val")
+        v = v[1:] if v[:1] in "Nn" and v[1:2] == "'" else v
+        if v[:1] in "'\"[":
+            v = v[1:]
+            if v[-1:] in "'\"]":
+                v = v[:-1]
+            v = v.replace("''", "'")
+        if v:
+            out.append(v)
+    return out
+
+
 FORBIDDEN_SQL_USERS = {"sistema"}
 
 
