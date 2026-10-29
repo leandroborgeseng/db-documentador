@@ -889,9 +889,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         except sqlconsole.QueryRejected as e:
             msg = safe_msg(str(e))
             log(f"[sql] recusada: {msg}")
-            hint = (" Instruções de escrita só no modo administrador (CONSOLE_ADMIN_ENABLED)."
-                    if consoleadmin.admin_active(CFG) else "")
-            self._send(400, {"error": msg + hint})
+            admin_on = consoleadmin.admin_active(CFG)
+            write_kw = msg.startswith("Palavra-chave não permitida")
+            hint = (" Para escrever, use Pré-visualizar escrita, logo abaixo." if admin_on and write_kw else
+                    " Instruções de escrita só no modo administrador (CONSOLE_ADMIN_ENABLED)." if admin_on else "")
+            self._send(400, {"error": msg + hint, **({"use_admin": True} if admin_on and write_kw else {})})
         except (ValueError, json.JSONDecodeError):
             self._send(400, {"error": "JSON inválido."})
         except Exception as e:
@@ -921,33 +923,74 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             AUDIT.write("negado", user, database, query, **_audit_extra(), step=step, result="credencial inválida")
             return self._send(403, {"error": "Credencial de administrador inválida. O console continua somente leitura."})
         try:
-            query = consoleadmin.validate_admin_query(query)
-        except consoleadmin.AdminRejected as e:
-            AUDIT.write("negado", user, database, query, **_audit_extra(), step=step, result="instrução fora da lista: " + str(e))
-            return self._send(403, {"error": safe_msg(str(e))})
-        try:
             database = _db_name(database)
         except sqlconsole.QueryRejected as e:
             AUDIT.write("negado", user, database, query, **_audit_extra(), step=step, result=str(e))
             return self._send(400, {"error": safe_msg(str(e))})
+        try:
+            cmds = consoleadmin.split_script(query, database)
+        except consoleadmin.AdminRejected as e:
+            AUDIT.write("negado", user, database, query, **_audit_extra(), step=step, result="instrução fora da lista: " + str(e))
+            return self._send(403, {"error": safe_msg(str(e))})
+        for c in cmds:  # banco de cada comando (vindo de USE) tem de ser um banco do console
+            if c["error"] is None:
+                try:
+                    c["database"] = _db_name(c["database"])
+                except sqlconsole.QueryRejected as e:
+                    c["error"] = str(e)
+        view = [{"n": i + 1, "database": c["database"] or "", "statement": safe_msg(c["statement"]),
+                 "ok": c["error"] is None, **({"error": safe_msg(c["error"])} if c["error"] else {})}
+                for i, c in enumerate(cmds)]
+        refused = [v for v in view if not v["ok"]]
+        if refused:
+            for c, v in zip(cmds, view):
+                if c["error"]:
+                    AUDIT.write("negado", user, c["database"] or "", c["statement"], **_audit_extra(), step=step,
+                                command=v["n"], result="instrução fora da lista: " + c["error"])
+            first = refused[0]
+            return self._send(403, {"error": f"Comando {first['n']} recusado: {first['error']}",
+                                    "commands": view, "can_confirm": False})
+        digest = consoleadmin.batch_digest(cmds)
         if step == "preview":
-            token = ADMIN_TOKENS.issue(user, database, query)
-            AUDIT.write("preview", user, database, query, **_audit_extra(), result="aguardando confirmação")
+            token = ADMIN_TOKENS.issue(user, database, digest)
+            for c, v in zip(cmds, view):
+                AUDIT.write("preview", user, c["database"], c["statement"], **_audit_extra(), command=v["n"],
+                            total=len(cmds), result="aguardando confirmação")
             return self._send(200, {"token": token, "database": database, "expires_in": CFG["admin_token_ttl"],
-                                    "statement": safe_msg(query)})
-        if data.get("confirm") is not True or not ADMIN_TOKENS.consume(data.get("token"), user, database, query):
+                                    "statement": view[0]["statement"] if len(view) == 1 else "",
+                                    "commands": view, "can_confirm": True})
+        if data.get("confirm") is not True or not ADMIN_TOKENS.consume(data.get("token"), user, database, digest):
             AUDIT.write("negado", user, database, query, **_audit_extra(), step=step,
                         result="confirmação ausente, expirada ou de outra instrução")
             return self._send(403, {"error": "Confirmação inválida ou expirada. Pré-visualize de novo."})
-        try:
-            result = run_admin_statement(database, query)
-        except Exception as e:
-            msg = _err_text(e)
-            AUDIT.write("erro", user, database, query, **_audit_extra(), result="erro", error=msg[:500])
-            return self._send(400, {"error": msg[:2000]})
-        AUDIT.write("executado", user, database, query, **_audit_extra(), result="ok", rowcount=result.get("rowcount"),
-                    elapsed_ms=result.get("elapsed_ms"))
-        return self._send(200, result)
+        results, failed = [], None
+        batch_secrets = [x for c in cmds for x in consoleadmin.extract_secrets(c["statement"])]
+        for c, v in zip(cmds, view):
+            if failed is not None:
+                results.append({**v, "status": "não executado"})
+                continue
+            try:
+                r = run_admin_statement(c["database"], c["statement"])
+            except Exception as e:
+                msg = consoleadmin.mask_secrets(_err_text(e), batch_secrets)  # servidor pode ecoar a senha
+                AUDIT.write("erro", user, c["database"], c["statement"], **_audit_extra(), command=v["n"],
+                            total=len(cmds), result="erro", error=msg[:500])
+                failed = v["n"]
+                results.append({**v, "status": "erro", "error": msg[:2000]})
+                continue
+            AUDIT.write("executado", user, c["database"], c["statement"], **_audit_extra(), command=v["n"],
+                        total=len(cmds), result="ok", rowcount=r.get("rowcount"), elapsed_ms=r.get("elapsed_ms"))
+            results.append({**v, "status": "ok", "rowcount": r.get("rowcount"), "elapsed_ms": r.get("elapsed_ms"),
+                            "result_sets": r.get("result_sets", [])})
+        if failed is not None:
+            err = results[failed - 1]["error"]
+            msg = (f"Parou no comando {failed} de {len(cmds)}: {err}"
+                   + (f" Os {len(cmds) - failed} seguintes não foram executados." if failed < len(cmds) else ""))
+            return self._send(400, {"error": msg if len(cmds) > 1 else err, "stopped_at": failed, "results": results})
+        last = results[-1]
+        return self._send(200, {"results": results, "rowcount": last.get("rowcount"),
+                                "elapsed_ms": sum(x.get("elapsed_ms") or 0 for x in results),
+                                "result_sets": last.get("result_sets", [])})
 
     def log_message(self, *args):
         pass

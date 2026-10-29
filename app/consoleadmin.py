@@ -42,6 +42,22 @@ def mask_secrets(text, extra=()):
     return text
 
 
+def extract_secrets(text):
+    """Valores literais depois de PASSWORD/SECRET/IDENTIFIED BY no texto (para apagar ecos em erros do servidor)."""
+    out = []
+    for m in _SECRET_RE.finditer(str(text or "")):
+        v = m.group("val")
+        v = v[1:] if v[:1] in "Nn" and v[1:2] == "'" else v
+        if v[:1] in "'\"[":
+            v = v[1:]
+            if v[-1:] in "'\"]":
+                v = v[:-1]
+            v = v.replace("''", "'")
+        if v:
+            out.append(v)
+    return out
+
+
 FORBIDDEN_SQL_USERS = {"sistema"}
 
 
@@ -55,6 +71,12 @@ def forbidden_sql_user(name):
 SISTEMA_MAX_DAYS = 7
 SISTEMA_MIN_PASS = 8  # senha do 'sistema' menor que isso: modo admin desligado (senha_curta)
 SP_TZ = "America/Sao_Paulo"
+LOGIN_MIN_PASS = 8  # PASSWORD do CREATE LOGIN no modo admin
+
+
+def password_ok(senha, minimo=SISTEMA_MIN_PASS):
+    """Senha aceitável: pelo menos `minimo` caracteres sem contar espaços nas pontas (só espaços = recusada)."""
+    return len(str(senha or "").strip()) >= minimo
 
 
 def today_sp():
@@ -123,7 +145,7 @@ def admin_problem(cfg):
         why = sistema_release_problem(cfg)
         if why:
             return f"CONSOLE_ADMIN_SQL_USER não pode ser o login 'sistema' (liberação temporária recusada: {why})"
-        if len(cfg["admin_sql_pass"]) < SISTEMA_MIN_PASS:
+        if not password_ok(cfg["admin_sql_pass"]):
             return "senha_curta"
     if audit_inside_output(cfg.get("admin_audit_log"), cfg.get("output")):
         return "CONSOLE_ADMIN_AUDIT_LOG fica dentro de OUTPUT_DIR (seria servido pela web)"
@@ -293,6 +315,10 @@ def _create_login(p):
     p.op("=")
     if p.peek() is None or p.peek().kind != "str":
         raise AdminRejected("PASSWORD deve ser um texto entre aspas.")
+    lit = p.peek().text
+    lit = lit[1:] if lit[:1] in "Nn" else lit
+    if not password_ok(lit[1:-1].replace("''", "'"), LOGIN_MIN_PASS):
+        raise AdminRejected(f"PASSWORD fraca: use pelo menos {LOGIN_MIN_PASS} caracteres, sem contar espaços.")
     p.i += 1
     if p.is_word("MUST_CHANGE"):
         p.i += 1
@@ -411,3 +437,88 @@ def validate_admin_query(sql):
     if not p.done():
         raise AdminRejected("Texto a mais depois da instrução. " + ALLOWED_DESC)
     return sql[toks[0].start:toks[-1].end]
+
+
+# ------------------------------------------------------------------ script inteiro (lote)
+
+MAX_BATCH = 200
+
+
+def _is_go(sql, toks, idx):
+    """GO separador: palavra GO sozinha na linha (fora de textos/comentários)."""
+    t = toks[idx]
+    if t.kind != "word" or t.text.upper() != "GO":
+        return False
+    line_start = sql.rfind("\n", 0, t.start) + 1
+    prev_ok = idx == 0 or toks[idx - 1].end <= line_start
+    nxt = sql.find("\n", t.end)
+    nxt = len(sql) if nxt < 0 else nxt
+    next_ok = idx + 1 >= len(toks) or toks[idx + 1].start > nxt
+    return prev_ok and next_ok
+
+
+def split_script(sql, default_db):
+    """Quebra um script em comandos do modo admin.
+
+    Separa por ';' e por GO (sozinho na linha), respeitando textos, identificadores e comentários
+    (o tokenizador do console já os reconhece). Linhas USE [banco] não viram comando: mudam o banco dos
+    comandos seguintes. Devolve lista de dicts {database, statement, error}; error != None = recusado.
+    Lança AdminRejected se o script não puder ser lido (aspas/comentário sem fechamento) ou for vazio.
+    """
+    from sqlconsole import QueryRejected, tokenize
+    if not sql or not sql.strip():
+        raise AdminRejected("Instrução vazia.")
+    if len(sql) > 100_000:
+        raise AdminRejected("Script muito longo para o modo administrador.")
+    try:
+        toks = tokenize(sql)
+    except QueryRejected as e:
+        raise AdminRejected(str(e)) from None
+    prev_end = 0  # comentários continuam proibidos (nem entre comandos): só espaço entre tokens
+    for t in toks + [None]:
+        gap = sql[prev_end:t.start] if t else sql[prev_end:]
+        if gap.strip():
+            raise AdminRejected("Comentários não são permitidos no modo administrador.")
+        prev_end = t.end if t else prev_end
+    groups, cur = [], []
+    for i, t in enumerate(toks):
+        if (t.kind == "op" and t.text == ";") or _is_go(sql, toks, i):
+            if cur:
+                groups.append(cur)
+            cur = []
+            continue
+        cur.append(t)
+    if cur:
+        groups.append(cur)
+    out, db = [], default_db
+    for g in groups:
+        if g[0].kind == "word" and g[0].text.upper() == "USE":
+            if len(g) < 2 or g[1].kind not in ("word", "ident"):
+                out.append({"database": db, "statement": sql[g[0].start:g[-1].end],
+                            "error": "USE sem nome de banco."})
+                db = None
+                continue
+            db = g[1].text.strip("[]\"").replace("]]", "]")
+            g = g[2:]  # USE banco sem ';' seguido do comando na mesma parte
+            if not g:
+                continue
+        text = sql[g[0].start:g[-1].end]
+        item = {"database": db, "statement": text, "error": None}
+        if db is None:
+            item["error"] = "Banco indefinido depois de um USE inválido."
+        else:
+            try:
+                item["statement"] = validate_admin_query(text)
+            except AdminRejected as e:
+                item["error"] = str(e)
+        out.append(item)
+    if not out:
+        raise AdminRejected("Nenhum comando no script (só USE ou separadores).")
+    if len(out) > MAX_BATCH:
+        raise AdminRejected(f"Script com mais de {MAX_BATCH} comandos.")
+    return out
+
+
+def batch_digest(commands):
+    """Texto canônico da lista (banco + comando) para prender o token de confirmação ao lote exato."""
+    return "\x1e".join(f"{c['database']}\x1f{c['statement']}" for c in commands)
