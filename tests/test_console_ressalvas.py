@@ -73,7 +73,7 @@ class B2Mask(unittest.TestCase):
         stmt = "CREATE LOGIN x WITH PASSWORD = 'Fake''Pw''77'"
         secrets_ = extract_secrets(stmt)
         self.assertEqual(secrets_, [pw])
-        for echo in (f"erro perto de 'Fake''Pw''77'", f"senha Fake''Pw''77 inválida", f"valor {pw} ruim",
+        for echo in ("erro perto de 'Fake''Pw''77'", "senha Fake''Pw''77 inválida", f"valor {pw} ruim",
                      "Msg 15118: 'Fake''Pw''77' não atende à política"):
             out = mask_secrets(echo, secrets_)
             self.assertNotIn("Fake", out, echo)
