@@ -37,7 +37,12 @@ def mask_secrets(text, extra=()):
         hashed = " HASHED" if re.search(r"HASHED$", m.group("val"), re.I) else ""
         return f"{m.group('kw')}{m.group('sep')}'***'{hashed}"
     text = _SECRET_RE.sub(repl, str(text))
-    for s in sorted((x for x in extra if x), key=len, reverse=True):  # qualquer tamanho, mais longo primeiro
+    variants = set()
+    for x in extra:
+        if x:
+            variants.add(x)
+            variants.add(x.replace("'", "''"))  # eco do servidor com aspas escapadas ('')
+    for s in sorted(variants, key=len, reverse=True):  # qualquer tamanho, mais longo primeiro
         text = text.replace(s, "***")
     return text
 
@@ -248,7 +253,8 @@ class AdminRejected(ValueError):
 
 
 ALLOWED_DESC = ("Permitido no modo administrador, uma instrução por vez: CREATE LOGIN, CREATE USER (com login), "
-                "ALTER ROLE db_datareader ADD MEMBER <usuário> e GRANT SELECT (objeto, schema ou banco, não para public).")
+                "e GRANT SELECT ON <tabela> TO <usuário> (tabela por tabela; não para public/guest, sem SCHEMA::, "
+                "DATABASE:: ou db_datareader).")
 _FORBIDDEN = {"INSERT", "UPDATE", "DELETE", "MERGE", "TRUNCATE", "DROP", "EXEC", "EXECUTE", "DENY",
               "REVOKE", "USE", "GO", "OPENROWSET", "OPENQUERY", "OPENDATASOURCE", "BULK", "SHUTDOWN",
               "DBCC", "KILL", "BEGIN", "COMMIT", "ROLLBACK", "INTO", "SELECT", "DECLARE", "SET", "CONTROL",
@@ -354,13 +360,16 @@ def _create_user(p):
 
 def _grant(p):
     p.word("SELECT")
-    if p.is_word("ON"):
+    if not p.is_word("ON"):
+        raise AdminRejected("GRANT SELECT sem objeto não é permitido: use GRANT SELECT ON <tabela> TO <usuário>.")
+    p.i += 1
+    if p.is_word("SCHEMA", "DATABASE") and p.is_op_at(1, ":"):
+        raise AdminRejected(f"GRANT SELECT ON {p.peek().text.upper()}:: não é permitido: conceda tabela por tabela.")
+    if p.is_word("OBJECT") and p.is_op_at(1, ":"):
         p.i += 1
-        if p.is_word("OBJECT", "SCHEMA", "DATABASE") and p.is_op_at(1, ":"):
-            p.i += 1
-            p.op(":")
-            p.op(":")
-        p.name(qualified=True)
+        p.op(":")
+        p.op(":")
+    p.name(qualified=True)
     p.word("TO")
     _grantee(p)
     while p.is_op(","):
@@ -370,8 +379,9 @@ def _grant(p):
 
 def _grantee(p):
     t = p.peek()
-    if t is not None and t.kind in ("word", "ident") and t.text.strip('[]"').strip().lower() == "public":
-        raise AdminRejected("GRANT SELECT para public não é permitido.")
+    who = t.text.strip('[]"').strip().lower() if t is not None and t.kind in ("word", "ident") else ""
+    if who in ("public", "guest"):
+        raise AdminRejected(f"GRANT SELECT para {who} não é permitido.")
     p.name()
 
 
@@ -418,6 +428,8 @@ def validate_admin_query(sql):
             raise AdminRejected(f"Palavra-chave não permitida no modo administrador ({u}). " + ALLOWED_DESC)
     p = _P(toks)
     first = p.word("CREATE", "ALTER", "GRANT")
+    if first == "ALTER":
+        raise AdminRejected("ALTER ROLE db_datareader não é permitido: conceda GRANT SELECT tabela por tabela.")
     if first == "CREATE":
         if p.word("LOGIN", "USER") == "LOGIN":
             _create_login(p)

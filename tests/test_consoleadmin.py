@@ -307,15 +307,9 @@ ALLOWED = [
     "CREATE USER x_ro FOR LOGIN x_ro",
     "CREATE USER x_ro FROM LOGIN x_ro WITH DEFAULT_SCHEMA = dbo",
     f"CREATE LOGIN x WITH PASSWORD = {PW}, DEFAULT_DATABASE = master",
-    "ALTER ROLE DB_DATAREADER ADD MEMBER x_ro", "ALTER ROLE [db_datareader] ADD MEMBER [x_ro]",
     "CREATE USER x_ro",
-    "ALTER ROLE db_datareader ADD MEMBER x_ro",
-    "  alter   role [db_datareader]\n add\tmember [x_ro]  ",
     "GRANT SELECT ON dbo.Aluno TO x_ro",
     "GRANT SELECT ON OBJECT::dbo.Aluno TO x_ro",
-    "GRANT SELECT ON SCHEMA::dbo TO x_ro, y_ro",
-    "GRANT SELECT ON DATABASE::dbdoc_test TO x_ro",
-    "GRANT SELECT TO x_ro",
     "GRANT SELECT ON [dbo].[Aluno] TO [x_ro]",
 ]
 BLOCKED = [
@@ -394,8 +388,8 @@ class AdminScopeRoutes(Routes):
 
     def test_allowed_types_execute(self):
         run = self.admin()
-        for q in ("CREATE USER x_ro FOR LOGIN x_ro", "ALTER ROLE db_datareader ADD MEMBER x_ro",
-                  "GRANT SELECT ON SCHEMA::dbo TO x_ro"):
+        for q in ("CREATE USER x_ro FOR LOGIN x_ro", "GRANT SELECT ON OBJECT::dbo.Aluno TO x_ro",
+                  "GRANT SELECT ON dbo.Aluno TO x_ro"):
             _, pv = call(run, "POST", "/api/sql/admin/preview", self.body(query=q))
             code, out = call(run, "POST", "/api/sql/admin/confirm", self.body(query=q, token=pv["token"], confirm=True))
             self.assertEqual(code, 200, (q, out))

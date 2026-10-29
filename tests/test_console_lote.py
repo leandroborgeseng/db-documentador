@@ -205,8 +205,7 @@ class GrantSelect(unittest.TestCase):
         for t in GESTAO + CORE:
             q = f"GRANT SELECT ON dbo.{t} TO {RO}"
             self.assertEqual(consoleadmin.validate_admin_query(q), q)
-        for q in ("GRANT SELECT ON SCHEMA::dbo TO x", "GRANT SELECT ON DATABASE::db TO x",
-                  "GRANT SELECT ON OBJECT::dbo.T TO x", "grant select on [dbo].[T] to [x]"):
+        for q in ("GRANT SELECT ON OBJECT::dbo.T TO x", "grant select on [dbo].[T] to [x]"):
             self.assertEqual(consoleadmin.validate_admin_query(q), q)
 
     def test_still_refused(self):

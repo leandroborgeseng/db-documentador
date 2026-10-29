@@ -893,6 +893,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             write_kw = msg.startswith("Palavra-chave não permitida")
             hint = (" Para escrever, use Pré-visualizar escrita, logo abaixo." if admin_on and write_kw else
                     " Instruções de escrita só no modo administrador (CONSOLE_ADMIN_ENABLED)." if admin_on else "")
+            if hint and not msg.endswith((".", "!", "?")):
+                msg += "."  # "…leitura. Para escrever, use…"
             self._send(400, {"error": msg + hint, **({"use_admin": True} if admin_on and write_kw else {})})
         except (ValueError, json.JSONDecodeError):
             self._send(400, {"error": "JSON inválido."})
@@ -985,7 +987,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if failed is not None:
             err = results[failed - 1]["error"]
             msg = (f"Parou no comando {failed} de {len(cmds)}: {err}"
-                   + (f" Os {len(cmds) - failed} seguintes não foram executados." if failed < len(cmds) else ""))
+                   + (" " + following_msg(len(cmds) - failed) if failed < len(cmds) else ""))
             return self._send(400, {"error": msg if len(cmds) > 1 else err, "stopped_at": failed, "results": results})
         last = results[-1]
         return self._send(200, {"results": results, "rowcount": last.get("rowcount"),
@@ -994,6 +996,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def log_message(self, *args):
         pass
+
+
+def following_msg(n):
+    """Comandos que não rodaram depois da parada (singular/plural)."""
+    return "O 1 seguinte não rodou." if n == 1 else f"Os {n} seguintes não rodaram."
 
 
 def serve():
