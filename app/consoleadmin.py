@@ -53,6 +53,7 @@ def forbidden_sql_user(name):
 
 
 SISTEMA_MAX_DAYS = 7
+SISTEMA_MIN_PASS = 8  # senha do 'sistema' menor que isso: modo admin desligado (senha_curta)
 SP_TZ = "America/Sao_Paulo"
 
 
@@ -122,6 +123,8 @@ def admin_problem(cfg):
         why = sistema_release_problem(cfg)
         if why:
             return f"CONSOLE_ADMIN_SQL_USER não pode ser o login 'sistema' (liberação temporária recusada: {why})"
+        if len(cfg["admin_sql_pass"]) < SISTEMA_MIN_PASS:
+            return "senha_curta"
     if audit_inside_output(cfg.get("admin_audit_log"), cfg.get("output")):
         return "CONSOLE_ADMIN_AUDIT_LOG fica dentro de OUTPUT_DIR (seria servido pela web)"
     return None
@@ -191,8 +194,9 @@ class TokenStore:
 class AuditLog:
     """Uma linha JSON por evento. O arquivo fica fora do diretório servido por HTTP."""
 
-    def __init__(self, path, logger=None, secrets_to_hide=()):
+    def __init__(self, path, logger=None, secrets_to_hide=(), output_dir=None):
         self.path, self.logger = path, logger
+        self.output_dir = output_dir
         self.secrets_to_hide = tuple(secrets_to_hide)
         self._lock = threading.Lock()
 
@@ -204,7 +208,11 @@ class AuditLog:
             rec[k] = mask_secrets(v, self.secrets_to_hide) if isinstance(v, str) else v
         line = json.dumps(rec, ensure_ascii=False)
         with self._lock:
-            if self.path:
+            if self.path and self.output_dir and audit_inside_output(self.path, self.output_dir):
+                if self.logger:
+                    self.logger("WARNING: CONSOLE_ADMIN_AUDIT_LOG fica dentro de OUTPUT_DIR; "
+                                "auditoria só no stdout, arquivo NÃO gravado")
+            elif self.path:
                 os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
                 with open(self.path, "a", encoding="utf-8") as f:
                     f.write(line + "\n")

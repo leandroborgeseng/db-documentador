@@ -97,7 +97,8 @@ def log(msg):
 _HIDDEN = tuple(v for v in (CFG["password"], CFG["sql_pass"], CFG["auth_pass"], CFG["admin_pass"],
                             CFG["admin_sql_pass"]) if v)
 ADMIN_TOKENS = consoleadmin.TokenStore(ttl=CFG["admin_token_ttl"])
-AUDIT = consoleadmin.AuditLog(CFG["admin_audit_log"], logger=log, secrets_to_hide=_HIDDEN)
+AUDIT = consoleadmin.AuditLog(CFG["admin_audit_log"], logger=log, secrets_to_hide=_HIDDEN,
+                              output_dir=CFG["output"])
 
 
 def safe_msg(msg):

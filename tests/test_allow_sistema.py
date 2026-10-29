@@ -240,6 +240,32 @@ class AllowSistema(tca.Routes):
         rec = consoleadmin.AuditLog("", secrets_to_hide=("k3y",)).write("erro", "u", error="erro k3y")
         self.assertEqual(rec["error"], "erro ***")
 
+    def test_short_sistema_password_keeps_admin_off(self):
+        short = "Ab3$xY7"  # fictícia, 7 caracteres
+        run = self.ok(CONSOLE_ADMIN_SQL_PASSWORD=short)
+        self.assertEqual(consoleadmin.admin_problem(run.CFG), "senha_curta")
+        self.assertEqual(call(run, "POST", "/api/sql/admin/preview", self.body())[0], 404)
+        rec = run.startup_audit()
+        self.assertEqual((rec["modo_admin"], rec["motivo"]), ("desligado", "senha_curta"))
+        self.assertNotIn(short, self.audit_text())
+        self.assertNotIn(short, str(rec))
+        self.assertIsNone(consoleadmin.admin_problem(self.ok(CONSOLE_ADMIN_SQL_PASSWORD=short + "8").CFG))
+
+    def test_audit_inside_output_stdout_only(self):
+        out = os.path.join(self.tmp.name, "out")
+        inside = os.path.join(out, "audit", "console-admin.log")
+        run = self.ok(CONSOLE_ADMIN_AUDIT_LOG=inside)
+        self.assertIn("OUTPUT_DIR", consoleadmin.admin_problem(run.CFG))
+        logs = []
+        run.AUDIT.logger = logs.append  # o logger real é o log() do run.py (stdout)
+        rec = run.startup_audit()
+        self.assertEqual(rec["modo_admin"], "desligado")
+        self.assertFalse(os.path.exists(inside))
+        out_txt = "\n".join(logs)
+        self.assertIn("WARNING", out_txt)
+        self.assertIn('"event": "inicio"', out_txt)
+        self.assertNotIn(SIS_PW, out_txt)
+
 
 if __name__ == "__main__":
     unittest.main()
