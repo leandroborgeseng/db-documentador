@@ -148,7 +148,7 @@ _FORBIDDEN = {"INSERT", "UPDATE", "DELETE", "MERGE", "TRUNCATE", "DROP", "EXEC",
               "REVOKE", "USE", "GO", "OPENROWSET", "OPENQUERY", "OPENDATASOURCE", "BULK", "SHUTDOWN",
               "DBCC", "KILL", "BEGIN", "COMMIT", "ROLLBACK", "INTO", "SELECT", "DECLARE", "SET", "CONTROL",
               "ALL", "AS", "CASCADE"}
-_LOGIN_OPTS = {"CHECK_POLICY", "CHECK_EXPIRATION", "DEFAULT_DATABASE", "DEFAULT_LANGUAGE", "SID"}
+_LOGIN_OPTS = {"CHECK_POLICY", "CHECK_EXPIRATION", "DEFAULT_DATABASE", "DEFAULT_LANGUAGE"}
 
 
 class _P:
@@ -205,24 +205,17 @@ class _P:
 
 def _create_login(p):
     p.name()
-    if p.is_word("FROM"):
-        p.word("FROM")
-        p.word("WINDOWS")
-        if p.done():
-            return
-        p.word("WITH")
-    else:
-        p.word("WITH")
-        p.word("PASSWORD")
-        p.op("=")
-        if p.peek() is None or p.peek().kind != "str":
-            raise AdminRejected("PASSWORD deve ser um texto entre aspas.")
+    p.word("WITH")
+    p.word("PASSWORD")
+    p.op("=")
+    if p.peek() is None or p.peek().kind != "str":
+        raise AdminRejected("PASSWORD deve ser um texto entre aspas.")
+    p.i += 1
+    if p.is_word("MUST_CHANGE"):
         p.i += 1
-        if p.is_word("MUST_CHANGE"):
-            p.i += 1
-        if p.done():
-            return
-        p.op(",")
+    if p.done():
+        return
+    p.op(",")
     while True:
         p.word(*_LOGIN_OPTS)
         p.op("=")

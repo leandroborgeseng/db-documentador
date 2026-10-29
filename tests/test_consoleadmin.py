@@ -293,7 +293,6 @@ ALLOWED = [
     f"create login [x_ro] with password={PW}, CHECK_POLICY = ON, CHECK_EXPIRATION = OFF;",
     f"CREATE LOGIN x WITH PASSWORD = {PW} MUST_CHANGE, CHECK_EXPIRATION = ON",
     f"CREATE LOGIN x WITH PASSWORD = {PW}, DEFAULT_DATABASE = dbdoc_test",
-    "CREATE LOGIN [DOM\\leandro] FROM WINDOWS",
     "CREATE USER x_ro FOR LOGIN x_ro",
     "CREATE USER x_ro FROM LOGIN x_ro WITH DEFAULT_SCHEMA = dbo",
     "CREATE USER x_ro WITHOUT LOGIN",
@@ -329,6 +328,8 @@ BLOCKED = [
     "SELECT * FROM t", "CREATE LOGIN a WITH PASSWORD = 'x', SID = 0x01, CREDENTIAL = c",
     "GRANT SELECT ON t TO u; GRANT CONTROL TO u", "CREATE LOGIN a FROM CERTIFICATE c",
     "SHUTDOWN", "", "   ;  ", "CREATE USER a; ;",
+    "CREATE LOGIN [DOM\\leandro] FROM WINDOWS", "create login x from windows with default_database = d",
+    "CREATE LOGIN a WITH PASSWORD = 'x', SID = 0x01", "CREATE LOGIN a WITH PASSWORD = 'x', sid=0x1234",
 ]
 
 
