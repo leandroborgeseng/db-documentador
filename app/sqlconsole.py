@@ -381,6 +381,7 @@ __SISTEMA__
 <input id="ap" type="password" placeholder="Senha admin" autocomplete="current-password">
 <button id="prev">Pré-visualizar escrita</button></div>
 <div id="conf" hidden><p id="chd">Confirme os comandos exatos (expira em <span id="cexp"></span> s):</p>
+<p id="cstale" role="status" hidden style="background:#fff4d6;color:#7a4b00;border:1px solid #e0a800;padding:6px 10px;border-radius:8px">O script mudou depois da prévia. Clique em Pré-visualizar escrita de novo.</p>
 <ol id="cst" style="background:var(--card);border:1px solid var(--bd);padding:8px 8px 8px 32px;border-radius:8px;font:13px ui-monospace,Consolas,monospace"></ol>
 <div class="bar"><button class="pri" id="cok" style="background:var(--err);border-color:var(--err)">Confirmar e executar</button><button id="cno">Cancelar</button></div></div>
 </section>
@@ -421,19 +422,24 @@ function cmdList(items,res){const ol=$('cst');ol.innerHTML='';(items||[]).forEac
  const st=res?(c.status==='ok'?'✓ ':c.status==='erro'?'✗ ':'— '):'';
  li.textContent=st+'['+(c.database||'?')+'] '+c.statement+(c.error?'  ⟶ '+c.error:'')+(c.status==='não executado'?'  (não executado)':'');
  li.style.whiteSpace='pre-wrap';if(!c.ok||c.status==='erro'){li.style.color='var(--err)'}ol.appendChild(li)})}
-$('prev').onclick=async()=>{$('err').textContent='';$('conf').hidden=true;pend=null;
+let previewShown=false;
+function markStale(){if(!previewShown||$('conf').hidden||!$('cstale').hidden)return;pend=null;$('cok').disabled=true;
+ $('cst').style.opacity='.45';$('cst').style.filter='grayscale(1)';$('cstale').hidden=false}
+function clearStale(){$('cstale').hidden=true;$('cst').style.opacity='';$('cst').style.filter=''}
+$('q').addEventListener('input',markStale);$('db').addEventListener('change',markStale);
+$('prev').onclick=async()=>{$('err').textContent='';$('conf').hidden=true;pend=null;clearStale();
  const body={database:$('db').value,query:$('q').value,admin_user:$('au').value,admin_password:$('ap').value};
  try{const d=await adminPost('/api/sql/admin/preview',body);
-  if(d.commands){cmdList(d.commands,false);$('conf').hidden=false;$('chd').textContent=d.can_confirm?
+  if(d.commands){cmdList(d.commands,false);$('conf').hidden=false;previewShown=true;$('chd').textContent=d.can_confirm?
    d.commands.length+' comando(s). Confirme a lista exata (expira em '+d.expires_in+' s):':'Há comando recusado (em vermelho). Corrija o script e pré-visualize de novo.';
    $('cok').disabled=!d.can_confirm}
   if(d.error){$('err').textContent=d.error;return}
   pend={...body,token:d.token};
  }catch(e){$('err').textContent='Erro de comunicação: '+e}};
-$('cno').onclick=()=>{pend=null;$('conf').hidden=true};
+$('cno').onclick=()=>{pend=null;$('conf').hidden=true;clearStale()};
 $('cok').onclick=async()=>{if(!pend||$('cok').disabled)return;const body={...pend,confirm:true};pend=null;$('cok').disabled=true;$('info').textContent='Executando escrita…';
  try{const d=await adminPost('/api/sql/admin/confirm',body);
-  if(d.results){cmdList(d.results,true);$('chd').textContent='Resultado por comando:'}
+  if(d.results){previewShown=false;cmdList(d.results,true);$('chd').textContent='Resultado por comando:'}
   if(d.error){$('err').textContent=d.error;$('info').textContent='';return}
   const sets=d.result_sets||[];last=sets;render(sets);$('csv').disabled=!sets.length;
   $('info').textContent='Escrita executada · '+(d.results||[]).length+' comando(s) · '+d.elapsed_ms+' ms';
