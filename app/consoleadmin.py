@@ -37,9 +37,8 @@ def mask_secrets(text, extra=()):
         hashed = " HASHED" if re.search(r"HASHED$", m.group("val"), re.I) else ""
         return f"{m.group('kw')}{m.group('sep')}'***'{hashed}"
     text = _SECRET_RE.sub(repl, str(text))
-    for s in extra:
-        if s and len(s) >= 4:
-            text = text.replace(s, "***")
+    for s in sorted((x for x in extra if x), key=len, reverse=True):  # qualquer tamanho, mais longo primeiro
+        text = text.replace(s, "***")
     return text
 
 
@@ -53,6 +52,63 @@ def forbidden_sql_user(name):
     return n in FORBIDDEN_SQL_USERS
 
 
+SISTEMA_MAX_DAYS = 7
+SISTEMA_MIN_PASS = 8  # senha do 'sistema' menor que isso: modo admin desligado (senha_curta)
+SP_TZ = "America/Sao_Paulo"
+
+
+def today_sp():
+    """Data de hoje em America/Sao_Paulo (substituível nos testes)."""
+    try:
+        from zoneinfo import ZoneInfo
+        return dt.datetime.now(ZoneInfo(SP_TZ)).date()
+    except Exception:  # sem tzdata: UTC-3 fixo
+        return (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=3)).date()
+
+
+def flag_true(value):
+    return str(value or "").strip().lower() in ("true", "1")
+
+
+def sistema_expiry(cfg):
+    """Data de CONSOLE_ADMIN_ALLOW_SISTEMA_ATE como date, ou None se ausente/inválida."""
+    raw = str(cfg.get("admin_allow_sistema_ate") or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+        return None
+    try:
+        return dt.date.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
+def sistema_release_problem(cfg, today=None):
+    """Motivo para recusar a liberação TEMPORÁRIA do login 'sistema', ou None se vale agora.
+
+    Reavaliado a cada requisição: quando a data passa, o modo admin desliga sem reiniciar.
+    O limite de 7 dias conta a partir da data de inicialização (cfg['admin_start_date']).
+    """
+    if not cfg.get("admin_allow_sistema"):
+        return "CONSOLE_ADMIN_ALLOW_SISTEMA desligado"
+    raw = str(cfg.get("admin_allow_sistema_ate") or "").strip()
+    if not raw:
+        return "CONSOLE_ADMIN_ALLOW_SISTEMA_ATE ausente"
+    exp = sistema_expiry(cfg)
+    if exp is None:
+        return "CONSOLE_ADMIN_ALLOW_SISTEMA_ATE inválida (use AAAA-MM-DD)"
+    today = today or today_sp()
+    start = cfg.get("admin_start_date") or today
+    if exp > start + dt.timedelta(days=SISTEMA_MAX_DAYS):
+        return f"CONSOLE_ADMIN_ALLOW_SISTEMA_ATE passa de {SISTEMA_MAX_DAYS} dias após a inicialização ({start.isoformat()})"
+    if exp < today:
+        return f"CONSOLE_ADMIN_ALLOW_SISTEMA_ATE vencida ({exp.isoformat()})"
+    return None
+
+
+def via_sistema(cfg):
+    """True quando o modo admin está usando o login 'sistema' pela liberação temporária válida."""
+    return forbidden_sql_user(cfg.get("admin_sql_user")) and sistema_release_problem(cfg) is None
+
+
 def admin_problem(cfg):
     """Motivo para o modo admin ficar desligado, ou None se pode ligar."""
     if not cfg.get("admin_enabled"):
@@ -62,7 +118,13 @@ def admin_problem(cfg):
     if not cfg.get("admin_sql_user") or not cfg.get("admin_sql_pass"):
         return "CONSOLE_ADMIN_SQL_USER/CONSOLE_ADMIN_SQL_PASSWORD ausentes (não há fallback para MSSQL_USER)"
     if forbidden_sql_user(cfg["admin_sql_user"]):
-        return "CONSOLE_ADMIN_SQL_USER não pode ser o login 'sistema'"
+        if not cfg.get("admin_allow_sistema"):
+            return "CONSOLE_ADMIN_SQL_USER não pode ser o login 'sistema'"
+        why = sistema_release_problem(cfg)
+        if why:
+            return f"CONSOLE_ADMIN_SQL_USER não pode ser o login 'sistema' (liberação temporária recusada: {why})"
+        if len(cfg["admin_sql_pass"]) < SISTEMA_MIN_PASS:
+            return "senha_curta"
     if audit_inside_output(cfg.get("admin_audit_log"), cfg.get("output")):
         return "CONSOLE_ADMIN_AUDIT_LOG fica dentro de OUTPUT_DIR (seria servido pela web)"
     return None
@@ -132,8 +194,9 @@ class TokenStore:
 class AuditLog:
     """Uma linha JSON por evento. O arquivo fica fora do diretório servido por HTTP."""
 
-    def __init__(self, path, logger=None, secrets_to_hide=()):
+    def __init__(self, path, logger=None, secrets_to_hide=(), output_dir=None):
         self.path, self.logger = path, logger
+        self.output_dir = output_dir
         self.secrets_to_hide = tuple(secrets_to_hide)
         self._lock = threading.Lock()
 
@@ -145,7 +208,11 @@ class AuditLog:
             rec[k] = mask_secrets(v, self.secrets_to_hide) if isinstance(v, str) else v
         line = json.dumps(rec, ensure_ascii=False)
         with self._lock:
-            if self.path:
+            if self.path and self.output_dir and audit_inside_output(self.path, self.output_dir):
+                if self.logger:
+                    self.logger("WARNING: CONSOLE_ADMIN_AUDIT_LOG fica dentro de OUTPUT_DIR; "
+                                "auditoria só no stdout, arquivo NÃO gravado")
+            elif self.path:
                 os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
                 with open(self.path, "a", encoding="utf-8") as f:
                     f.write(line + "\n")

@@ -375,6 +375,7 @@ Limite de __MAX__ linhas por resultado e __TIMEOUT__ s.</p>
 <div id="err" role="alert"></div>
 <section id="adm" hidden style="margin:16px 0;padding:12px;border:2px solid var(--err);border-radius:10px">
 <h2 style="color:var(--err);margin-top:0">Modo administrador (escrita)</h2>
+__SISTEMA__
 <p class="m">Executa a instrução do editor <b>com efeito real</b> (sem desfazer). Cada execução pede confirmação e fica na auditoria, com senhas mascaradas.</p>
 <div class="bar"><input id="au" placeholder="Usuário admin" autocomplete="username">
 <input id="ap" type="password" placeholder="Senha admin" autocomplete="current-password">
