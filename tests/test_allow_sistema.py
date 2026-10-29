@@ -8,7 +8,8 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
-from test_consoleadmin import Routes, FakeConn, call, FAKE  # noqa: E402
+import test_consoleadmin as tca  # noqa: E402
+from test_consoleadmin import FakeConn, call, FAKE  # noqa: E402
 import consoleadmin  # noqa: E402
 
 SIS_PW = "Fake-Sistema-Pw-9"  # fictícia
@@ -19,7 +20,7 @@ def d(days):
     return (TODAY + dt.timedelta(days=days)).isoformat()
 
 
-class AllowSistema(Routes):
+class AllowSistema(tca.Routes):
     def sis(self, **extra):
         env = {"CONSOLE_ADMIN_SQL_USER": "sistema", "CONSOLE_ADMIN_SQL_PASSWORD": SIS_PW,
                "OUTPUT_DIR": os.path.join(self.tmp.name, "out")}
